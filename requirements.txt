@@ -1,4 +1,2 @@
-streamlit
-pandas
-openpyxl
-supabase
+streamlit>=1.32
+supabase>=2.3.0
