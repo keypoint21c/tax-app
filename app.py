@@ -1,664 +1,712 @@
 # app.py
+# ==========================================================
+# 개인사업자 성실신고 리스크 & 법인전환 전략 분석 (Streamlit)
+# - Supabase 승인/로그인(이메일만) + 관리자 승인관리 화면 포함
+# - 엑셀 업로드 기반 소득율 자동 계산(F->C, K->Q, 소득율=100-Q)
+#
+# 필요한 Streamlit Secrets (TOML):
+# SUPABASE_URL = "https://xxxxx.supabase.co"
+# SUPABASE_SERVICE_ROLE_KEY = "서비스 롤 키(절대 공개X)"
+# ADMIN_BOOTSTRAP_KEY = "아주긴랜덤문자열"
+#
+# (선택) 기본 관리자 이메일을 하드코딩하고 싶으면 DEFAULT_ADMIN_EMAIL 사용
+# DEFAULT_ADMIN_EMAIL = "keypoint21c@gmail.com"
+#
+# requirements.txt 예시:
+# streamlit
+# pandas
+# openpyxl
+# supabase
+# ==========================================================
+
 import os
 import math
-import sqlite3
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from openpyxl import load_workbook
 
-# =========================
-# Streamlit config (MUST be first Streamlit command)
-# =========================
-st.set_page_config(page_title="성실신고 리스크 & 법인전환 분석", layout="wide")
+# Supabase (supabase-py)
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 
-# =========================
-# 기본 설정
-# =========================
-APP_TITLE = "📊 개인사업자 성실신고 리스크 & 법인전환 전략 분석"
 
-# (1) 엑셀 기본 파일: app.py와 같은 폴더에 두면 자동 인식
-DEFAULT_EXCEL_FILENAME = "업종코드-표준산업분류 연계표_기준경비율 코드 작성.xlsx"
-DEFAULT_EXCEL_PATH = os.path.join(os.path.dirname(__file__), DEFAULT_EXCEL_FILENAME)
+# -----------------------------
+# Streamlit 기본 설정
+# -----------------------------
+st.set_page_config(page_title="성실신고 리스크 & 법인전환 전략 분석", layout="wide")
 
-# (2) 로컬 DB (Supabase 없을 때만 사용)
-SQLITE_DB_FILE = "users.db"
 
-# (3) 관리자 최초 부트스트랩(배포 시 환경변수/Secrets로 넣는 걸 추천)
-# 예) STREAMLIT_SECRETS 또는 OS env로 설정 가능
-ADMIN_EMAIL = st.secrets.get("ADMIN_EMAIL", os.getenv("ADMIN_EMAIL", ""))
-# 아래 키를 알고 있는 사람만 "관리자 부트스트랩" 버튼을 사용할 수 있음 (선택)
-ADMIN_BOOTSTRAP_KEY = st.secrets.get("ADMIN_BOOTSTRAP_KEY", os.getenv("ADMIN_BOOTSTRAP_KEY", ""))
-
-# (4) Supabase (있으면 우선 사용)
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
-
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
-supabase = None
-if USE_SUPABASE:
+# -----------------------------
+# 유틸: 숫자 표시
+# -----------------------------
+def fmt_won(x: float) -> str:
     try:
-        from supabase import create_client  # type: ignore
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception as e:
-        USE_SUPABASE = False
-        supabase = None
-
-
-# =========================
-# 공통 유틸
-# =========================
-def money(n: float) -> str:
-    try:
-        n = int(round(float(n)))
+        return f"{int(round(x)):,.0f}원"
     except Exception:
-        return "-"
-    return f"{n:,}원"
+        return f"{x}원"
 
 
-def pct(n: float, digits=1) -> str:
+def fmt_pct(x: float, nd: int = 2) -> str:
     try:
-        return f"{float(n):.{digits}f}%"
+        return f"{x:.{nd}f}%"
     except Exception:
-        return "-"
+        return f"{x}%"
 
 
+# -----------------------------
+# (핵심) 엑셀에서 소득율 산출
+#   - F열: 산업분류코드
+#   - C열: 업종코드
+#   - K열: 업종코드
+#   - Q열: Q값
+#   - 소득율 = 100 - Q값
+# -----------------------------
 @dataclass
 class IncomeRateResult:
-    industry_code: int
-    biz_code: float
+    industry_code: str
+    biz_code: str
     q_value: float
-    income_rate: float  # percent
+    income_rate_pct: float
 
 
-# =========================
-# 1) 사용자 DB 레이어 (Supabase 우선, 없으면 SQLite)
-# =========================
-def sqlite_init():
-    conn = sqlite3.connect(SQLITE_DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            approved INTEGER DEFAULT 0,
-            is_admin INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
+def excel_col_letter_to_index(letter: str) -> int:
+    # A=1, B=2 ... (openpyxl 기준)
+    letter = letter.strip().upper()
+    n = 0
+    for ch in letter:
+        if not ("A" <= ch <= "Z"):
+            raise ValueError("Invalid column letter")
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
 
 
-def sqlite_get_user(email: str) -> Optional[Dict[str, Any]]:
-    conn = sqlite3.connect(SQLITE_DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT email, approved, is_admin FROM users WHERE email=?", (email,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
+@st.cache_data(show_spinner=False)
+def load_workbook_cached(file_bytes: bytes):
+    # openpyxl은 파일 객체를 필요로 하므로 bytes를 temp로 처리
+    # streamlit cache에는 bytes->wb 반환 형태로 저장
+    from io import BytesIO
+    bio = BytesIO(file_bytes)
+    wb = load_workbook(bio, data_only=True)
+    return wb
+
+
+def find_value_in_column(ws, col_letter: str, target: str) -> Optional[int]:
+    """지정 열(col_letter)에서 target과 '문자열 기준으로 동일'한 행 번호를 찾는다."""
+    col_idx = excel_col_letter_to_index(col_letter)
+    target_norm = str(target).strip()
+
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(row=r, column=col_idx).value
+        if v is None:
+            continue
+        if str(v).strip() == target_norm:
+            return r
+    return None
+
+
+def read_cell(ws, col_letter: str, row: int):
+    col_idx = excel_col_letter_to_index(col_letter)
+    return ws.cell(row=row, column=col_idx).value
+
+
+def compute_income_rate_from_excel(file_bytes: bytes, industry_code: str) -> IncomeRateResult:
+    wb = load_workbook_cached(file_bytes)
+    ws = wb.active
+
+    # 1) F열에서 산업분류코드 찾기 -> 그 행의 C열 = 업종코드
+    row_f = find_value_in_column(ws, "F", industry_code)
+    if row_f is None:
+        raise ValueError(f"엑셀 F열에서 산업분류코드({industry_code})를 찾지 못했습니다.")
+
+    biz_code = read_cell(ws, "C", row_f)
+    if biz_code is None or str(biz_code).strip() == "":
+        raise ValueError("해당 행의 C열(업종코드)이 비어 있습니다.")
+    biz_code_str = str(biz_code).strip()
+
+    # 2) K열에서 업종코드 찾기 -> 그 행의 Q열 = Q값
+    row_k = find_value_in_column(ws, "K", biz_code_str)
+    if row_k is None:
+        raise ValueError(f"엑셀 K열에서 업종코드({biz_code_str})를 찾지 못했습니다.")
+
+    q_val = read_cell(ws, "Q", row_k)
+    if q_val is None or str(q_val).strip() == "":
+        raise ValueError("해당 행의 Q열(Q값)이 비어 있습니다.")
+
+    try:
+        q_val_f = float(q_val)
+    except Exception:
+        raise ValueError(f"Q값이 숫자가 아닙니다: {q_val}")
+
+    income_rate = 100.0 - q_val_f
+    return IncomeRateResult(
+        industry_code=str(industry_code).strip(),
+        biz_code=biz_code_str,
+        q_value=q_val_f,
+        income_rate_pct=income_rate,
+    )
+
+
+# -----------------------------
+# 세금(종합소득세) 계산 (단순화 버전)
+# - 실제 공제/필요경비/세액공제는 반영 안됨
+# - "리스크 체감" 목적의 추정치
+# -----------------------------
+# (참고) 2024년 기준으로 널리 알려진 누진 구간(단순 적용).
+# 만약 최신 세율/구간이 변경되면 아래만 수정하면 됨.
+INCOME_TAX_BRACKETS = [
+    (14_000_000, 0.06),
+    (50_000_000, 0.15),
+    (88_000_000, 0.24),
+    (150_000_000, 0.35),
+    (300_000_000, 0.38),
+    (500_000_000, 0.40),
+    (1_000_000_000, 0.42),
+    (float("inf"), 0.45),
+]
+
+
+def calc_progressive_tax(taxable: float) -> float:
+    """누진세(단순) 계산: 과세표준을 taxable로 보고 구간별 누진 계산"""
+    if taxable <= 0:
+        return 0.0
+
+    tax = 0.0
+    prev = 0.0
+    for limit, rate in INCOME_TAX_BRACKETS:
+        if taxable <= limit:
+            tax += (taxable - prev) * rate
+            break
+        tax += (limit - prev) * rate
+        prev = limit
+    return tax
+
+
+def calc_total_income_tax_with_local(taxable: float, local_rate: float = 0.10) -> float:
+    nat = calc_progressive_tax(taxable)
+    local = nat * local_rate
+    return nat + local
+
+
+# -----------------------------
+# 성실신고확인대상 위험도 판단
+# -----------------------------
+def sungshil_risk_level(category: str, sales: float) -> Tuple[str, float]:
+    """
+    category:
+      - 도소매: 15억 이상
+      - 제조/건설: 7.5억 이상
+      - 서비스/임대: 5억 이상
+    return: (위험도 라벨, 기준값)
+    """
+    cat = category.strip()
+    if cat == "도소매":
+        threshold = 1_500_000_000
+    elif cat == "제조/건설":
+        threshold = 750_000_000
+    else:  # 서비스/임대
+        threshold = 500_000_000
+
+    ratio = sales / threshold if threshold > 0 else 0
+
+    if ratio < 0.7:
+        return ("낮음", threshold)
+    if ratio < 1.0:
+        return ("보통", threshold)
+    if ratio < 1.3:
+        return ("높음", threshold)
+    return ("매우 높음", threshold)
+
+
+# -----------------------------
+# Supabase DB (users 테이블)
+# users(email text primary key, approved boolean, is_admin boolean)
+# -----------------------------
+def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    # Streamlit Cloud: st.secrets
+    # 로컬: 환경변수 fallback
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def get_supabase_client():
+    if create_client is None:
+        st.error("Supabase 라이브러리(supabase)가 설치되지 않았습니다. requirements.txt에 'supabase'를 추가하세요.")
+        st.stop()
+
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_SERVICE_ROLE_KEY")  # 서버에서만 쓰는 키 (절대 유출 X)
+
+    if not url or not key:
+        st.error("Supabase 설정이 없습니다. Streamlit Cloud → Settings → Secrets에 SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY를 넣어주세요.")
+        st.stop()
+
+    return create_client(url, key)
+
+
+def db_get_user(sb, email: str) -> Optional[Dict[str, Any]]:
+    res = sb.table("users").select("*").eq("email", email).execute()
+    data = getattr(res, "data", None)
+    if not data:
         return None
-    return {"email": row[0], "approved": bool(row[1]), "is_admin": bool(row[2])}
+    return data[0]
 
 
-def sqlite_upsert_user(email: str, approved: Optional[bool] = None, is_admin: Optional[bool] = None):
-    conn = sqlite3.connect(SQLITE_DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (email, approved, is_admin) VALUES (?, 0, 0)", (email,))
-    if approved is not None:
-        c.execute("UPDATE users SET approved=? WHERE email=?", (1 if approved else 0, email))
-    if is_admin is not None:
-        c.execute("UPDATE users SET is_admin=? WHERE email=?", (1 if is_admin else 0, email))
-    conn.commit()
-    conn.close()
+def db_upsert_user(sb, email: str, approved: bool = False, is_admin: bool = False) -> Dict[str, Any]:
+    payload = {"email": email, "approved": approved, "is_admin": is_admin}
+    res = sb.table("users").upsert(payload).execute()
+    data = getattr(res, "data", None)
+    if not data:
+        # upsert 후 select로 재조회
+        u = db_get_user(sb, email)
+        if u:
+            return u
+        raise RuntimeError("DB upsert 실패")
+    return data[0]
 
 
-def sqlite_list_users() -> list[Dict[str, Any]]:
-    conn = sqlite3.connect(SQLITE_DB_FILE)
-    c = conn.cursor()
-    rows = c.execute("SELECT email, approved, is_admin FROM users ORDER BY email").fetchall()
-    conn.close()
-    return [{"email": r[0], "approved": bool(r[1]), "is_admin": bool(r[2])} for r in rows]
+def db_set_approval(sb, email: str, approved: bool):
+    sb.table("users").update({"approved": approved}).eq("email", email).execute()
 
 
-def supa_get_user(email: str) -> Optional[Dict[str, Any]]:
-    assert supabase is not None
-    resp = supabase.table("users").select("*").eq("email", email).execute()
-    data = resp.data or []
-    return data[0] if data else None
+def db_set_admin(sb, email: str, is_admin: bool):
+    sb.table("users").update({"is_admin": is_admin}).eq("email", email).execute()
 
 
-def supa_upsert_user(email: str, approved: Optional[bool] = None, is_admin: Optional[bool] = None):
-    assert supabase is not None
-    existing = supa_get_user(email)
-    if not existing:
-        payload = {"email": email, "approved": bool(approved) if approved is not None else False,
-                   "is_admin": bool(is_admin) if is_admin is not None else False}
-        supabase.table("users").insert(payload).execute()
-        return
-    payload = {}
-    if approved is not None:
-        payload["approved"] = bool(approved)
-    if is_admin is not None:
-        payload["is_admin"] = bool(is_admin)
-    if payload:
-        supabase.table("users").update(payload).eq("email", email).execute()
+def db_list_users(sb) -> List[Dict[str, Any]]:
+    res = sb.table("users").select("*").order("email").execute()
+    return getattr(res, "data", []) or []
 
 
-def supa_list_users() -> list[Dict[str, Any]]:
-    assert supabase is not None
-    resp = supabase.table("users").select("*").order("email").execute()
-    return resp.data or []
+# -----------------------------
+# 로그인/세션
+# -----------------------------
+def session_get_email() -> Optional[str]:
+    return st.session_state.get("auth_email")
 
 
-def db_init():
-    if USE_SUPABASE:
-        # Supabase는 테이블이 이미 있어야 합니다. (SQL: users 테이블 생성)
-        return
-    sqlite_init()
+def session_set_email(email: Optional[str]):
+    st.session_state["auth_email"] = email
 
 
-def db_get_user(email: str) -> Optional[Dict[str, Any]]:
-    if USE_SUPABASE:
-        return supa_get_user(email)
-    return sqlite_get_user(email)
-
-
-def db_upsert_user(email: str, approved: Optional[bool] = None, is_admin: Optional[bool] = None):
-    if USE_SUPABASE:
-        return supa_upsert_user(email, approved=approved, is_admin=is_admin)
-    return sqlite_upsert_user(email, approved=approved, is_admin=is_admin)
-
-
-def db_list_users() -> list[Dict[str, Any]]:
-    if USE_SUPABASE:
-        return supa_list_users()
-    return sqlite_list_users()
-
-
-db_init()
-
-
-# =========================
-# 2) 로그인/승인 게이트
-# =========================
 def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def login_and_gate() -> Dict[str, Any]:
-    """
-    - 이메일 입력 → 사용자 레코드 없으면 자동 생성(approved=False)
-    - approved True 일 때만 앱 사용 가능
-    - 반환: current_user dict (email, approved, is_admin)
-    """
-    st.sidebar.markdown("### 🔐 접근 제어")
-    st.sidebar.caption("승인된 사용자만 이용 가능합니다.")
+def ensure_user_record(sb, email: str) -> Dict[str, Any]:
+    email = normalize_email(email)
+    u = db_get_user(sb, email)
+    if u is None:
+        # 최초 접속자는 승인 false로 등록
+        u = db_upsert_user(sb, email, approved=False, is_admin=False)
 
-    if "email" not in st.session_state:
-        st.session_state.email = ""
+        # (선택) DEFAULT_ADMIN_EMAIL로 자동 관리자 등록
+        default_admin = get_secret("DEFAULT_ADMIN_EMAIL")
+        if default_admin and normalize_email(default_admin) == email:
+            u = db_upsert_user(sb, email, approved=True, is_admin=True)
 
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    return u
 
-    if not st.session_state.logged_in:
-        email = st.sidebar.text_input("이메일", value=st.session_state.email, placeholder="name@example.com")
-        if st.sidebar.button("로그인", type="primary"):
-            email = normalize_email(email)
-            if "@" not in email or "." not in email:
-                st.sidebar.error("올바른 이메일 형식이 아닙니다.")
-                st.stop()
 
-            st.session_state.email = email
+# -----------------------------
+# UI: 사이드바 로그인/접근제어
+# -----------------------------
+def render_access_sidebar(sb):
+    st.sidebar.markdown("## 🔐 접근 제어")
 
-            user = db_get_user(email)
-            if not user:
-                db_upsert_user(email, approved=False, is_admin=False)
-                st.sidebar.warning("등록되었습니다. 관리자 승인 대기 중입니다.")
-                st.stop()
-
-            # 승인 전이면 차단
-            if not bool(user.get("approved", False)):
-                st.sidebar.warning("관리자 승인 대기 중입니다.")
-                st.stop()
-
-            st.session_state.logged_in = True
+    cur_email = session_get_email()
+    if cur_email:
+        st.sidebar.success(f"로그인됨: {cur_email}")
+        if st.sidebar.button("로그아웃"):
+            session_set_email(None)
             st.rerun()
-
-        st.stop()
-
-    # 로그인 상태면 사용자 로드
-    email = normalize_email(st.session_state.email)
-    user = db_get_user(email)
-    if not user:
-        # 아주 예외적인 경우
-        st.sidebar.error("사용자 정보를 찾을 수 없습니다. 다시 로그인해주세요.")
-        st.session_state.logged_in = False
-        st.rerun()
-
-    # 승인 해제되면 즉시 차단
-    if not bool(user.get("approved", False)):
-        st.sidebar.warning("승인이 해제되었습니다. 관리자에게 문의하세요.")
-        st.session_state.logged_in = False
-        st.stop()
-
-    st.sidebar.success(f"접속: {email}")
-    return user
-
-
-def admin_bootstrap_ui():
-    """
-    관리자 이메일을 환경변수 ADMIN_EMAIL로 지정한 경우,
-    최초에 관리자 계정을 승인+관리자로 만들어주는 UI.
-    (보안을 위해 ADMIN_BOOTSTRAP_KEY를 설정해두면 키 입력이 있어야 실행됩니다.)
-    """
-    if not BOOTSTRAP_ADMIN_EMAIL:
+        st.sidebar.divider()
         return
 
-    with st.sidebar.expander("🛠 관리자 초기설정(최초 1회)"):
-        st.caption("최초에 관리자 계정을 승인+관리자로 설정합니다.")
-        st.code(f"ADMIN_EMAIL = {BOOTSTRAP_ADMIN_EMAIL}", language="text")
-
-        if BOOTSTRAP_ADMIN_KEY:
-            key = st.text_input("부트스트랩 키", type="password", help="환경변수 ADMIN_BOOTSTRAP_KEY")
-            ok = st.button("관리자 계정 생성/갱신")
-            if ok:
-                if key != BOOTSTRAP_ADMIN_KEY:
-                    st.error("키가 틀렸습니다.")
-                else:
-                    db_upsert_user(BOOTSTRAP_ADMIN_EMAIL, approved=True, is_admin=True)
-                    st.success("관리자 계정을 승인+관리자로 설정했습니다.")
+    email = st.sidebar.text_input("이메일", placeholder="name@example.com")
+    if st.sidebar.button("로그인", use_container_width=True):
+        if not email or "@" not in email:
+            st.sidebar.error("이메일을 올바르게 입력하세요.")
         else:
-            if st.button("관리자 계정 생성/갱신"):
-                db_upsert_user(BOOTSTRAP_ADMIN_EMAIL, approved=True, is_admin=True)
-                st.success("관리자 계정을 승인+관리자로 설정했습니다.")
-
-
-admin_bootstrap_ui()
-current_user = login_and_gate()
-
-
-# =========================
-# 3) 엑셀 기반 소득율 계산
-# =========================
-def load_mapping_excel(uploaded_file) -> pd.DataFrame:
-    # 업로드 우선
-    if uploaded_file is not None:
-        return pd.read_excel(uploaded_file)
-
-    # 기본 파일이 app 폴더에 있으면 자동 사용
-    if os.path.exists(DEFAULT_EXCEL_PATH):
-        return pd.read_excel(DEFAULT_EXCEL_PATH)
-
-    raise FileNotFoundError(
-        f"기본 엑셀 파일을 찾지 못했습니다.\n"
-        f"- 앱 폴더에 '{DEFAULT_EXCEL_FILENAME}' 파일을 넣거나\n"
-        f"- 왼쪽에서 엑셀을 업로드해 주세요."
-    )
-
-
-def calc_income_rate(df: pd.DataFrame, industry_code: int) -> IncomeRateResult:
-    """
-    - F열에서 산업분류코드 찾기
-    - 해당 행의 C열 값을 ‘업종코드’
-    - K열에서 업종코드 찾기
-    - 해당 행의 Q열 값을 ‘Q값’
-    - 소득율 = 100 - Q값
-    """
-    # A=0 기준 (F=5, C=2, K=10, Q=16)
-    row_f = df[df.iloc[:, 5] == industry_code]
-    if row_f.empty:
-        raise ValueError("F열에서 산업분류코드를 찾지 못했습니다. (산업분류코드 불일치)")
-
-    biz_code = float(row_f.iloc[0, 2])
-
-    row_k = df[df.iloc[:, 10] == biz_code]
-    if row_k.empty:
-        raise ValueError("K열에서 업종코드를 찾지 못했습니다. (업종코드 매칭 실패)")
-
-    q_value = float(row_k.iloc[0, 16])
-    income_rate = 100.0 - q_value
-
-    return IncomeRateResult(industry_code=industry_code, biz_code=biz_code, q_value=q_value, income_rate=income_rate)
-
-
-# =========================
-# 4) 세금/리스크 계산
-# =========================
-def korean_progressive_income_tax(tax_base: float) -> float:
-    """
-    종합소득세(국세) 누진세율 계산(단순화: 과세표준=순이익 가정)
-    """
-    x = max(0.0, float(tax_base))
-
-    brackets = [
-        (14_000_000, 0.06, 0),
-        (50_000_000, 0.15, 1_260_000),
-        (88_000_000, 0.24, 5_760_000),
-        (150_000_000, 0.35, 15_440_000),
-        (300_000_000, 0.38, 19_940_000),
-        (500_000_000, 0.40, 25_940_000),
-        (1_000_000_000, 0.42, 35_940_000),
-        (math.inf, 0.45, 65_940_000),
-    ]
-
-    for upper, rate, deduction in brackets:
-        if x <= upper:
-            return x * rate - deduction
-    return x * 0.45 - 65_940_000
-
-
-def local_income_tax(national_tax: float) -> float:
-    return max(0.0, float(national_tax)) * 0.10
-
-
-def faithful_report_risk(category: str, sales: float) -> Tuple[str, str]:
-    thresholds = {
-        "도소매": 1_500_000_000,
-        "제조/건설": 750_000_000,
-        "서비스/부동산임대": 500_000_000,
-    }
-    th = thresholds.get(category, 750_000_000)
-    s = float(sales)
-
-    if s < th * 0.8:
-        return "낮음", f"기준 {money(th)} 대비 여유 구간"
-    elif s < th:
-        return "보통", f"기준 {money(th)} 근접 (주의)"
-    elif s < th * 1.2:
-        return "높음", f"기준 {money(th)} 초과 (대상 가능성 높음)"
-    else:
-        return "매우 높음", f"기준 {money(th)} 크게 초과 (대상 가능성 매우 높음)"
-
-
-def conservative_disallow_amounts(sales: float) -> Dict[str, float]:
-    s = float(sales)
-    return {
-        "외주가공비": s * 0.02,
-        "가족·특수관계인 인건비": s * 0.01,
-        "차량·접대 등 사적경비": s * 0.01,
-        "무증빙·현금지출": s * 0.005,
-    }
-
-
-def build_report_md(
-    result: IncomeRateResult,
-    last_sales: float,
-    this_sales: float,
-    employees: int,
-    category: str,
-    insurance_rate: float,
-    ceo_salary: float,
-    corp_tax_rate: float,
-    use_disallow: bool,
-    disallow_custom: Optional[Dict[str, float]],
-) -> str:
-    income_rate = result.income_rate / 100.0
-
-    last_profit = float(last_sales) * income_rate
-    this_profit = float(this_sales) * income_rate
-
-    nat_tax = korean_progressive_income_tax(this_profit)
-    loc_tax = local_income_tax(nat_tax)
-    total_tax = nat_tax + loc_tax
-
-    up_profit = float(this_sales) * ((result.income_rate + 1.0) / 100.0)
-    down_profit = float(this_sales) * ((result.income_rate - 1.0) / 100.0)
-
-    up_total_tax = korean_progressive_income_tax(up_profit) + local_income_tax(korean_progressive_income_tax(up_profit))
-    down_total_tax = korean_progressive_income_tax(down_profit) + local_income_tax(korean_progressive_income_tax(down_profit))
-    delta_up = up_total_tax - total_tax
-    delta_down = total_tax - down_total_tax
-
-    risk, reason = faithful_report_risk(category, this_sales)
-
-    disallow = {}
-    if use_disallow:
-        disallow = disallow_custom if disallow_custom else conservative_disallow_amounts(this_sales)
-
-    rows = []
-    total_disallow = 0.0
-    add_tax_total = 0.0
-    add_ins_total = 0.0
-
-    for k, amt in disallow.items():
-        amt = max(0.0, float(amt))
-        total_disallow += amt
-
-        add_tax_n = korean_progressive_income_tax(this_profit + amt) - korean_progressive_income_tax(this_profit)
-        add_tax_l = local_income_tax(korean_progressive_income_tax(this_profit + amt)) - local_income_tax(korean_progressive_income_tax(this_profit))
-        add_tax = max(0.0, add_tax_n + add_tax_l)
-
-        add_ins = amt * float(insurance_rate)
-
-        add_tax_total += add_tax
-        add_ins_total += add_ins
-
-        rows.append((k, amt, amt, add_tax, add_ins))
-
-    base_annual = total_tax + (this_profit * float(insurance_rate))
-    base_3y = base_annual * 3
-
-    strict_annual = base_annual + add_tax_total + add_ins_total
-    strict_3y = strict_annual * 3
-    strict_3y_inc = strict_3y - base_3y
-
-    corp_tax_base = max(0.0, this_profit - float(ceo_salary))
-    corp_tax = corp_tax_base * float(corp_tax_rate)
-    corp_3y = corp_tax * 3
-
-    md = []
-    md.append("# 개인사업자 성실신고 리스크 및 법인전환 전략 분석 보고서\n\n")
-
-    md.append("## 1) 소득율 산출 결과\n")
-    md.append(f"- 산업분류코드: **{result.industry_code}**\n")
-    md.append(f"- 업종코드: **{int(result.biz_code)}**\n")
-    md.append(f"- Q값: **{result.q_value}**\n")
-    md.append(f"- 계산된 소득율: **{pct(result.income_rate, 1)}**\n\n")
-
-    md.append("## 2) 순이익 추정\n")
-    md.append(f"- 작년 매출: {money(last_sales)} → 작년 순이익(추정): **{money(last_profit)}**\n")
-    md.append(f"- 금년 예상 매출: {money(this_sales)} → 금년 순이익(추정): **{money(this_profit)}**\n\n")
-
-    md.append("## 3) 종합소득세(추정) + 지방소득세 포함\n")
-    md.append("- (단순) 과세표준 ≈ 순이익으로 가정\n")
-    md.append(f"- 국세(종합소득세): **{money(nat_tax)}**\n")
-    md.append(f"- 지방소득세(국세의 10%): **{money(loc_tax)}**\n")
-    md.append(f"- 합계: **{money(total_tax)}**\n\n")
-    md.append("### 소득율 민감도(±1%p)\n")
-    md.append(f"- 소득율 +1%p 시 세금 증가(추정): **{money(delta_up)}**\n")
-    md.append(f"- 소득율 -1%p 시 세금 감소(추정): **{money(delta_down)}**\n\n")
-
-    md.append("## 4) 성실신고확인대상 여부 판단\n")
-    md.append(f"- 업종 분류: **{category}**\n")
-    md.append(f"- 위험도: **{risk}**\n")
-    md.append(f"- 근거: {reason}\n\n")
-
-    md.append("## 5) 성실신고 비용 부인 시뮬레이션\n")
-    if not use_disallow:
-        md.append("- (설정 OFF)\n\n")
-    else:
-        if not rows:
-            md.append("- 부인 가정 항목이 없습니다.\n\n")
-        else:
-            md.append("| 항목 | 가정 비용 부인 금액 | 과세소득 증가 | 추가 종합소득세(지방세 포함) | 건보 증가(추정) |\n")
-            md.append("|---|---:|---:|---:|---:|\n")
-            for (k, amt, inc_tax_base, add_tax, add_ins) in rows:
-                md.append(f"| {k} | {money(amt)} | {money(inc_tax_base)} | {money(add_tax)} | {money(add_ins)} |\n")
-            md.append("\n")
-            md.append(f"- 총 비용 부인 금액: **{money(total_disallow)}**\n")
-            md.append(f"- 총 추가 세금(추정): **{money(add_tax_total)}**\n")
-            md.append(f"- 총 건보 증가(추정): **{money(add_ins_total)}**\n")
-            if total_disallow > 0:
-                per_100m = (add_tax_total / total_disallow) * 100_000_000
-                md.append(f"\n👉 참고: 비용 1억 정리 시 추가 세금(추정) ≈ **{money(per_100m)}**\n")
-            md.append("\n")
-
-    md.append("## 6) 3년 누적 리스크(추정)\n")
-    md.append(f"- 개인 유지(현재 구조) 3년: **{money(base_3y)}** (세금+건보)\n")
-    if use_disallow:
-        md.append(f"- 성실신고 비용 정리 발생 3년: **{money(strict_3y)}**\n")
-        md.append(f"- 3년 증가분: **{money(strict_3y_inc)}**\n")
-        md.append("- 5년 누적 시에는 증가분이 더 커질 수 있습니다(구조적 누적).\n\n")
-    else:
-        md.append("\n")
-
-    md.append("## 7) 법인 전환 시 비교(단순 모델)\n")
-    md.append(f"- 대표 급여 가정: **{money(ceo_salary)}**\n")
-    md.append(f"- 법인 과세표준(단순): max(0, 순이익-급여) = **{money(corp_tax_base)}**\n")
-    md.append(f"- 법인세(가정 세율 {corp_tax_rate*100:.1f}%): **{money(corp_tax)}**\n\n")
-
-    md.append("### 3년 누적 비교표(단순)\n")
-    md.append("| 구분 | 개인 유지(현재) | 성실신고 정리 후 | 법인 전환 |\n")
-    md.append("|---|---:|---:|---:|\n")
-    md.append(f"| 3년 합계(세금+건보) | {money(base_3y)} | {money(strict_3y) if use_disallow else '-'} | {money(corp_3y)} |\n\n")
-
-    md.append("## 8) 전략적 결론\n")
-    md.append("- **매출 규모가 성실신고 기준에 근접/초과하는 업종**에서는 비용 증빙 리스크가 누적됩니다.\n")
-    md.append("- 성실신고 국면에서는 ‘비용 정리’가 곧 ‘과세소득 증가’로 연결되어 세금+건보가 함께 상승하는 구조가 됩니다.\n")
-    md.append("- 법인 전환은 **급여/비용 구조 설계로 과세를 분산**할 수 있어 ‘리스크 통제’ 목적에서 의미가 있습니다.\n\n")
-
-    md.append("## 1차 미팅 클로징 멘트(샘플)\n")
-    md.append(
-        "대표님, 지금은 ‘세금이 많다/적다’가 아니라 **구조적으로 성실신고 리스크 구간**에 들어온 상태입니다. "
-        "특히 비용 증빙 이슈가 생기면 3년 누적 금액이 크게 벌어질 수 있어, 이번에 **개인 유지 vs 비용정리 vs 법인전환**을 숫자로 비교해서 "
-        "가장 안전한 구조로 설계해보시죠.\n"
-    )
-
-    return "".join(md)
-
-
-# =========================
-# 5) UI
-# =========================
-st.title(APP_TITLE)
-
-st.sidebar.markdown("---")
-st.sidebar.caption(f"DB 모드: {'Supabase(배포용)' if USE_SUPABASE else 'SQLite(로컬용)'}")
-
-with st.sidebar:
-    st.subheader("1) 데이터 입력")
-    uploaded = st.file_uploader("업종코드-표준산업분류 연계표 엑셀 업로드(권장)", type=["xlsx"])
-    if os.path.exists(DEFAULT_EXCEL_PATH):
-        st.caption(f"기본 파일 자동 인식: {DEFAULT_EXCEL_FILENAME}")
-    else:
-        st.caption("기본 파일이 없으면 업로드가 필요합니다.")
-
-    industry_code = st.number_input("산업분류코드(F열)", min_value=0, step=1, value=25913)
-    last_sales = st.number_input("작년 매출(원)", min_value=0, step=10_000_000, value=800_000_000)
-    this_sales = st.number_input("금년 예상 매출(원)", min_value=0, step=10_000_000, value=1_000_000_000)
-    employees = st.number_input("직원 수(대표 제외)", min_value=0, step=1, value=6)
-
-    st.divider()
-    st.subheader("2) 성실신고 기준(업종 분류)")
-    category = st.selectbox("업종 분류 선택", ["제조/건설", "도소매", "서비스/부동산임대"], index=0)
-
-    st.divider()
-    st.subheader("3) 건보/법인 가정값")
-    insurance_rate = st.slider("건강보험 증가 추정률(과세소득 대비)", 0.0, 0.15, 0.05, 0.005)
-    ceo_salary = st.number_input("법인 전환 시 대표 급여 가정(원)", min_value=0, step=1_000_000, value=70_000_000)
-    corp_tax_rate = st.slider("법인세(단순 가정 세율)", 0.05, 0.25, 0.09, 0.005)
-
-    st.divider()
-    st.subheader("4) 비용 부인 시뮬레이션")
-    use_disallow = st.checkbox("성실신고 비용 부인 시뮬레이션 ON", value=True)
-    use_custom = st.checkbox("부인 금액 직접 입력(커스텀)", value=False)
-
-    disallow_custom = None
-    if use_disallow and use_custom:
-        st.caption("금년 매출 기준 ‘가정 비용 부인 금액’을 원 단위로 직접 입력하세요.")
-        d1 = st.number_input("외주가공비(원)", min_value=0, step=1_000_000, value=int(this_sales * 0.02))
-        d2 = st.number_input("가족·특수관계인 인건비(원)", min_value=0, step=1_000_000, value=int(this_sales * 0.01))
-        d3 = st.number_input("차량·접대 등 사적경비(원)", min_value=0, step=1_000_000, value=int(this_sales * 0.01))
-        d4 = st.number_input("무증빙·현금지출(원)", min_value=0, step=500_000, value=int(this_sales * 0.005))
-        disallow_custom = {
-            "외주가공비": float(d1),
-            "가족·특수관계인 인건비": float(d2),
-            "차량·접대 등 사적경비": float(d3),
-            "무증빙·현금지출": float(d4),
-        }
-
-run = st.button("✅ 보고서 생성", type="primary")
-
-if run:
-    try:
-        df_map = load_mapping_excel(uploaded)
-        r = calc_income_rate(df_map, int(industry_code))
-
-        report_md = build_report_md(
-            result=r,
-            last_sales=float(last_sales),
-            this_sales=float(this_sales),
-            employees=int(employees),
-            category=category,
-            insurance_rate=float(insurance_rate),
-            ceo_salary=float(ceo_salary),
-            corp_tax_rate=float(corp_tax_rate),
-            use_disallow=bool(use_disallow),
-            disallow_custom=disallow_custom,
-        )
-
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
-            st.subheader("📌 핵심 결과(요약)")
-            st.metric("소득율", pct(r.income_rate, 1))
-            st.metric("Q값", f"{r.q_value}")
-            st.metric("업종코드", f"{int(r.biz_code)}")
-            st.info("보고서 본문은 오른쪽에 출력됩니다. 아래에서 .md로 다운로드도 가능합니다.")
-
-        with col2:
-            st.subheader("🧾 보고서")
-            st.markdown(report_md)
-
-        st.download_button(
-            "⬇️ 보고서 다운로드 (Markdown .md)",
-            data=report_md.encode("utf-8"),
-            file_name=f"report_{industry_code}.md",
-            mime="text/markdown",
-        )
-
-    except Exception as e:
-        st.error(f"오류 발생: {e}")
-        st.stop()
-
-st.caption("※ 본 앱은 ‘순이익=매출×소득율’, ‘과세표준≈순이익’ 등 단순화 가정을 포함합니다. 실제 세무 신고/설계는 공제·경비·소득구성에 따라 달라집니다.")
-
-# =========================
-# 6) 관리자 페이지 (DB의 is_admin으로만 판단)
-# =========================
-st.sidebar.markdown("---")
-if bool(current_user.get("is_admin", False)):
-    st.sidebar.subheader("👑 관리자 메뉴")
-    if st.sidebar.checkbox("사용자 승인/차단 관리"):
-        st.subheader("👑 사용자 승인 관리")
-        users = db_list_users()
-
-        for u in users:
-            email = u["email"]
-            approved = bool(u.get("approved", False))
-            is_admin = bool(u.get("is_admin", False))
-
-            c1, c2, c3, c4 = st.columns([3, 1.2, 1.2, 1.2])
-            c1.write(email)
-            c2.write("관리자" if is_admin else "-")
-
-            # 승인/차단
-            btn_label = "승인" if not approved else "차단"
-            if c3.button(btn_label, key=f"appr_{email}"):
-                db_upsert_user(email, approved=(not approved))
+            email_n = normalize_email(email)
+            _ = ensure_user_record(sb, email_n)
+            session_set_email(email_n)
+            st.rerun()
+
+    st.sidebar.caption("※ 최초 로그인 시 DB에 자동 등록되며, 관리자가 승인하면 사용 가능합니다.")
+
+
+# -----------------------------
+# UI: 관리자 패널
+# -----------------------------
+def render_admin_panel(sb, me: Dict[str, Any]):
+    st.subheader("🛠 관리자 기능")
+
+    # 1) 관리자 초기설정(부트스트랩)
+    with st.expander("🛠 관리자 초기설정(최초 1회)", expanded=False):
+        st.write("ADMIN_BOOTSTRAP_KEY가 맞으면, 현재 로그인 이메일을 관리자/승인 처리합니다.")
+        boot = st.text_input("ADMIN_BOOTSTRAP_KEY", type="password")
+        if st.button("관리자 계정 생성/갱신"):
+            expected = get_secret("ADMIN_BOOTSTRAP_KEY")
+            if not expected:
+                st.error("Secrets에 ADMIN_BOOTSTRAP_KEY가 없습니다.")
+            elif boot != expected:
+                st.error("키가 일치하지 않습니다.")
+            else:
+                db_upsert_user(sb, me["email"], approved=True, is_admin=True)
+                st.success("관리자/승인 처리 완료! 앱을 새로고침하세요.")
                 st.rerun()
 
-            # 관리자 토글 (자기 자신 해제 방지)
-            if email == current_user["email"]:
-                c4.write("본인")
-            else:
-                if c4.button("관리자ON" if not is_admin else "관리자OFF", key=f"admin_{email}"):
-                    db_upsert_user(email, is_admin=(not is_admin))
-                    # 관리자 계정은 승인도 같이 켜주는 게 안전
-                    if not is_admin:
-                        db_upsert_user(email, approved=True)
-                    st.rerun()
-else:
-    st.sidebar.caption("관리자 권한이 없습니다.")
+    st.divider()
+
+    # 2) 승인 관리 테이블
+    st.markdown("### ✅ 승인 관리")
+    users = db_list_users(sb)
+    if not users:
+        st.info("users 테이블에 데이터가 없습니다.")
+        return
+
+    df = pd.DataFrame(users)
+    # 보기 편하게 정렬/표시
+    df = df[["email", "approved", "is_admin"]].sort_values("email")
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 승인/관리자 변경")
+    col1, col2, col3 = st.columns([2, 1, 1])
+    target_email = col1.text_input("대상 이메일", placeholder="someone@example.com")
+    new_approved = col2.selectbox("승인", options=[True, False], index=0)
+    new_admin = col3.selectbox("관리자", options=[True, False], index=1)
+
+    if st.button("변경 적용"):
+        if not target_email or "@" not in target_email:
+            st.error("대상 이메일이 올바르지 않습니다.")
+        else:
+            e = normalize_email(target_email)
+            ensure_user_record(sb, e)
+            db_set_approval(sb, e, bool(new_approved))
+            db_set_admin(sb, e, bool(new_admin))
+            st.success("변경 완료")
+            st.rerun()
+
+
+# -----------------------------
+# 보고서 계산
+# -----------------------------
+@dataclass
+class ReportInput:
+    industry_code: str
+    last_sales: float
+    this_sales: float
+    employees: int
+    category: str
+
+    health_rate: float
+    corp_tax_rate: float
+    ceo_salary: float
+
+    # 비용 부인 가정 비율
+    deny_outsource: float
+    deny_family_pay: float
+    deny_private: float
+    deny_cash: float
+
+
+def build_report(inp: ReportInput, income_rate_pct: float) -> Dict[str, Any]:
+    rate = income_rate_pct / 100.0
+
+    # 1) 순이익 추정
+    last_profit = inp.last_sales * rate
+    this_profit = inp.this_sales * rate
+
+    # 2) 종합소득세(지방세 포함) 추정
+    tax_this = calc_total_income_tax_with_local(this_profit)
+    tax_last = calc_total_income_tax_with_local(last_profit)
+
+    # 민감도 (+/- 1%p 소득율)
+    tax_this_up = calc_total_income_tax_with_local(inp.this_sales * ((income_rate_pct + 1.0) / 100.0))
+    tax_this_dn = calc_total_income_tax_with_local(inp.this_sales * ((income_rate_pct - 1.0) / 100.0))
+    delta_up = tax_this_up - tax_this
+    delta_dn = tax_this - tax_this_dn
+
+    # 3) 성실신고 리스크
+    risk_label, threshold = sungshil_risk_level(inp.category, inp.this_sales)
+
+    # 4) 비용 부인 시뮬레이션
+    deny_items = [
+        ("외주가공비(부인)", inp.deny_outsource),
+        ("가족·특수관계인 인건비(부인)", inp.deny_family_pay),
+        ("차량·접대 등 사적경비(부인)", inp.deny_private),
+        ("무증빙·현금지출(부인)", inp.deny_cash),
+    ]
+
+    rows = []
+    base_tax = tax_this
+    total_deny = 0.0
+    total_add_tax = 0.0
+    total_add_health = 0.0
+
+    for name, r in deny_items:
+        deny_amt = inp.this_sales * r
+        new_tax = calc_total_income_tax_with_local(this_profit + deny_amt)
+        add_tax = new_tax - base_tax
+        add_health = deny_amt * inp.health_rate
+
+        rows.append({
+            "항목": name,
+            "가정 부인금액": deny_amt,
+            "증가 과세소득": deny_amt,
+            "추가 종합소득세(지방세 포함)": add_tax,
+            "건강보험 증가 추정": add_health,
+        })
+
+        total_deny += deny_amt
+        total_add_tax += add_tax
+        total_add_health += add_health
+
+    sim_df = pd.DataFrame(rows)
+
+    # 5) 3년 누적
+    base_3y = (base_tax + (this_profit * inp.health_rate)) * 3
+    after_3y = ((base_tax + total_add_tax) + ((this_profit + total_deny) * inp.health_rate)) * 3
+    inc_3y = after_3y - base_3y
+
+    # 6) 법인 전환 비교(단순화)
+    # - 대표 급여는 비용으로 처리된다고 가정(법인 과세표준 감소)
+    corp_taxable = max(0.0, this_profit - inp.ceo_salary)
+    corp_tax = corp_taxable * inp.corp_tax_rate
+
+    # 개인 유지/성실신고 정리/법인 전환 3년 비교(아주 단순)
+    # 개인 유지: base_tax + 건강(이익*rate) *3
+    # 성실신고 정리: (base_tax+add_tax) + 건강((이익+부인)*rate) *3
+    # 법인 전환: 법인세 + (대표 급여에 대한 개인세는 미반영) + 건강(직장 전환 효과는 '절감'으로 표현만)
+    corp_3y = corp_tax * 3  # 단순 (추가로 4대보험/급여 소득세 등은 별도)
+    compare = pd.DataFrame([
+        {"구분": "개인 유지", "3년 추정세금+건보(단순)": base_3y},
+        {"구분": "성실신고 정리 후", "3년 추정세금+건보(단순)": after_3y},
+        {"구분": "법인 전환(법인세 중심 단순)", "3년 추정세금+건보(단순)": corp_3y},
+    ])
+
+    # 결론용 문구
+    if total_deny > 0:
+        per_100m = (total_add_tax / total_deny) if total_deny else 0
+        example_text = f"비용 {fmt_won(100_000_000)} 정리 시 세금은 대략 {fmt_won(100_000_000 * per_100m)} 수준으로 증가할 수 있습니다(단순 추정)."
+    else:
+        example_text = "비용 부인 시뮬레이션 값이 0이라 예시 문구를 만들 수 없습니다."
+
+    return {
+        "last_profit": last_profit,
+        "this_profit": this_profit,
+        "tax_last": tax_last,
+        "tax_this": base_tax,
+        "delta_up": delta_up,
+        "delta_dn": delta_dn,
+        "risk_label": risk_label,
+        "risk_threshold": threshold,
+        "sim_df": sim_df,
+        "total_deny": total_deny,
+        "total_add_tax": total_add_tax,
+        "total_add_health": total_add_health,
+        "base_3y": base_3y,
+        "after_3y": after_3y,
+        "inc_3y": inc_3y,
+        "corp_taxable": corp_taxable,
+        "corp_tax": corp_tax,
+        "compare_df": compare,
+        "example_text": example_text,
+    }
+
+
+# -----------------------------
+# 메인 UI
+# -----------------------------
+def main():
+    st.title("📊 개인사업자 성실신고 리스크 & 법인전환 전략 분석 (배포용)")
+
+    # Supabase 연결
+    sb = get_supabase_client()
+
+    # 사이드바 로그인/접근제어
+    render_access_sidebar(sb)
+
+    # 로그인 체크
+    email = session_get_email()
+    if not email:
+        st.info("왼쪽 사이드바에서 이메일로 로그인하세요.")
+        st.stop()
+
+    # 유저 상태 조회
+    me = ensure_user_record(sb, email)
+
+    # 승인 여부 체크
+    if not me.get("approved", False):
+        st.warning("등록되었습니다. 관리자 승인 대기 중입니다.")
+        st.caption("관리자에게 승인 요청 후 다시 접속하세요.")
+        st.stop()
+
+    # 관리자면 패널 표시
+    if me.get("is_admin", False):
+        with st.expander("🛠 관리자 패널(승인/관리자 설정)", expanded=False):
+            render_admin_panel(sb, me)
+
+    st.divider()
+
+    # --------------------------------
+    # 입력 UI
+    # --------------------------------
+    st.subheader("1) 기본 입력")
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+
+    industry_code = c1.text_input("산업분류코드(F열)", value="25913")
+    last_sales = c2.number_input("작년 매출(원)", min_value=0, value=800_000_000, step=10_000_000)
+    this_sales = c3.number_input("금년 예상 매출(원)", min_value=0, value=1_000_000_000, step=10_000_000)
+    employees = int(c4.number_input("직원 수(대표 제외)", min_value=0, value=6, step=1))
+
+    st.subheader("2) 성실신고 기준(업종 분류)")
+    category = st.selectbox("업종 분류 선택", options=["제조/건설", "도소매", "서비스/임대"], index=0)
+
+    st.subheader("3) 엑셀 업로드(필수)")
+    st.caption("업종코드-표준산업분류 연계표 엑셀을 업로드해야 소득율을 계산할 수 있습니다.")
+    xlsx = st.file_uploader("연계표_기준경비율 엑셀(.xlsx) 업로드", type=["xlsx"])
+
+    st.subheader("4) 건보/법인 가정값")
+    cc1, cc2, cc3 = st.columns([1, 1, 1])
+    health_rate = cc1.slider("건강보험 증가 추정률(과세소득 대비)", 0.00, 0.20, 0.05, 0.01)
+    corp_tax_rate = cc2.slider("법인세(단순 가정)", 0.05, 0.25, 0.09, 0.01)
+    ceo_salary = cc3.number_input("법인 전환 시 대표 급여 가정(원/년)", min_value=0, value=70_000_000, step=1_000_000)
+
+    st.subheader("5) 성실신고 비용 부인 시뮬레이션(보수적 기본값)")
+    s1, s2, s3, s4 = st.columns(4)
+    deny_outsource = s1.slider("외주가공비(매출 대비)", 0.0, 0.10, 0.02, 0.005)
+    deny_family_pay = s2.slider("가족/특수관계인 인건비(매출 대비)", 0.0, 0.10, 0.01, 0.005)
+    deny_private = s3.slider("차량/접대 등 사적경비(매출 대비)", 0.0, 0.10, 0.01, 0.005)
+    deny_cash = s4.slider("무증빙/현금지출(매출 대비)", 0.0, 0.05, 0.005, 0.0025)
+
+    st.divider()
+
+    # --------------------------------
+    # 보고서 생성 버튼
+    # --------------------------------
+    if st.button("✅ 보고서 생성", use_container_width=True):
+        if not xlsx:
+            st.error("엑셀 파일을 업로드해 주세요.")
+            st.stop()
+
+        try:
+            r = compute_income_rate_from_excel(xlsx.getvalue(), industry_code)
+        except Exception as e:
+            st.error(f"소득율 산출 실패: {e}")
+            st.stop()
+
+        inp = ReportInput(
+            industry_code=industry_code,
+            last_sales=float(last_sales),
+            this_sales=float(this_sales),
+            employees=employees,
+            category=category,
+            health_rate=float(health_rate),
+            corp_tax_rate=float(corp_tax_rate),
+            ceo_salary=float(ceo_salary),
+            deny_outsource=float(deny_outsource),
+            deny_family_pay=float(deny_family_pay),
+            deny_private=float(deny_private),
+            deny_cash=float(deny_cash),
+        )
+
+        rep = build_report(inp, r.income_rate_pct)
+
+        # --------------------------------
+        # 보고서 출력 (요청한 순서대로)
+        # --------------------------------
+        st.header("📌 최종 보고서")
+
+        st.subheader("1) 소득율 산출 결과")
+        st.write(f"- 산업분류코드: **{r.industry_code}**")
+        st.write(f"- 업종코드(C열): **{r.biz_code}**")
+        st.write(f"- Q값(Q열): **{r.q_value}**")
+        st.write(f"- 계산된 소득율: **{fmt_pct(r.income_rate_pct)}**")
+
+        st.subheader("2) 순이익 추정")
+        st.write(f"- 작년 순이익(추정): **{fmt_won(rep['last_profit'])}**")
+        st.write(f"- 금년 순이익(추정): **{fmt_won(rep['this_profit'])}**")
+        st.caption("※ 순이익=매출×소득율(단순). 실제는 경비/소득구성에 따라 달라집니다.")
+
+        st.subheader("3) 종합소득세 계산(지방소득세 포함, 단순 추정)")
+        st.write(f"- 작년 예상 세금: **{fmt_won(rep['tax_last'])}**")
+        st.write(f"- 금년 예상 세금: **{fmt_won(rep['tax_this'])}**")
+        st.write(f"- 소득율 +1%p 시 세금 증가(추정): **{fmt_won(rep['delta_up'])}**")
+        st.write(f"- 소득율 -1%p 시 세금 감소(추정): **{fmt_won(rep['delta_dn'])}**")
+        st.caption("※ 공제/세액공제/기타소득 합산 등은 미반영된 ‘리스크 체감용’ 추정치입니다.")
+
+        st.subheader("4) 성실신고확인대상 여부 판단(국세청 기준 기반)")
+        st.write(f"- 업종 분류: **{category}**")
+        st.write(f"- 기준 매출: **{fmt_won(rep['risk_threshold'])}**")
+        st.write(f"- 금년 매출: **{fmt_won(this_sales)}**")
+        st.write(f"- 위험도: **{rep['risk_label']}**")
+
+        st.subheader("5) 성실신고 시 비용 부인 시뮬레이션")
+        st.dataframe(
+            rep["sim_df"].assign(
+                **{
+                    "가정 부인금액": rep["sim_df"]["가정 부인금액"].map(fmt_won),
+                    "증가 과세소득": rep["sim_df"]["증가 과세소득"].map(fmt_won),
+                    "추가 종합소득세(지방세 포함)": rep["sim_df"]["추가 종합소득세(지방세 포함)"].map(fmt_won),
+                    "건강보험 증가 추정": rep["sim_df"]["건강보험 증가 추정"].map(fmt_won),
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.write(f"- 총 비용 부인 금액: **{fmt_won(rep['total_deny'])}**")
+        st.write(f"- 총 추가 세금(추정): **{fmt_won(rep['total_add_tax'])}**")
+        st.write(f"- 총 건강보험 증가(추정): **{fmt_won(rep['total_add_health'])}**")
+        st.info(rep["example_text"])
+
+        st.subheader("6) 3년 누적 리스크 계산(단순)")
+        st.write(f"- 현재 구조 유지(3년) 세금+건보(단순): **{fmt_won(rep['base_3y'])}**")
+        st.write(f"- 성실신고 비용 정리 후(3년) 세금+건보(단순): **{fmt_won(rep['after_3y'])}**")
+        st.write(f"- 3년 증가분(단순): **{fmt_won(rep['inc_3y'])}**")
+        st.caption("※ 5년 누적은 변동성이 커서 ‘확률/추세’로만 언급하는 것을 권장합니다.")
+
+        st.subheader("7) 법인 전환 시 비교 분석(단순)")
+        st.write(f"- 법인 과세표준(단순): max(0, 순이익 - 대표급여) = **{fmt_won(rep['corp_taxable'])}**")
+        st.write(f"- 법인세(단순): 과세표준 × {fmt_pct(inp.corp_tax_rate*100, 2)} = **{fmt_won(rep['corp_tax'])}**")
+        st.caption("※ 실제는 대표 급여 소득세/4대보험/업무용승용차/퇴직금/배당 등 설계가 핵심입니다.")
+
+        st.markdown("#### 3년 누적 비교표(단순)")
+        cdf = rep["compare_df"].copy()
+        cdf["3년 추정세금+건보(단순)"] = cdf["3년 추정세금+건보(단순)"].map(fmt_won)
+        st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+        st.subheader("8) 전략적 결론(상담용)")
+        st.write(
+            "- **핵심 리스크**: 매출 규모가 성실신고 기준에 근접/초과하면 ‘비용 정리(부인)’가 발생할 때 세금과 건보가 동시에 뛰는 구조입니다.\n"
+            "- **대응 방향**: (1) 증빙 체계 강화 + (2) 비용 항목 구조 점검 + (3) 법인 전환/급여·배당 설계로 리스크를 분산하는 시나리오를 병행합니다.\n"
+            "- **다음 액션**: 실제 계정별 비용/인건비/외주 구조를 받아 ‘부인 가능성’ 높은 항목부터 방어 자료(계약서/작업지시/세금계산서/입금증)를 정리합니다."
+        )
+
+        st.subheader("📞 1차 미팅 클로징 멘트(바로 사용)")
+        st.write(
+            "“대표님, 지금 숫자만 봐도 성실신고 구간에서 **비용 정리 1~2건**이 생기면 "
+            "세금과 건보가 **동시에 올라가는 구조**예요. 오늘은 ‘위험이 큰 비용 항목’부터 먼저 잡고, "
+            "동시에 **법인 전환/급여 설계 시나리오**까지 같이 비교해서 ‘가장 안전한 선택지’를 만들겠습니다.”"
+        )
+
+    st.caption("© 배포용 버전 — 숫자는 ‘리스크 체감용 단순 추정’이며, 실제 신고/설계는 세무사 검토가 필요합니다.")
+
+
+if __name__ == "__main__":
+    main()
+
+
 
 
