@@ -27,13 +27,13 @@ SQLITE_DB_FILE = "users.db"
 
 # (3) 관리자 최초 부트스트랩(배포 시 환경변수/Secrets로 넣는 걸 추천)
 # 예) STREAMLIT_SECRETS 또는 OS env로 설정 가능
-BOOTSTRAP_ADMIN_EMAIL = ((st.secrets.get("ADMIN_EMAIL") if hasattr(st, "secrets") else None) or os.getenv("ADMIN_EMAIL", "")).strip()
+ADMIN_EMAIL = st.secrets.get("ADMIN_EMAIL", os.getenv("ADMIN_EMAIL", ""))
 # 아래 키를 알고 있는 사람만 "관리자 부트스트랩" 버튼을 사용할 수 있음 (선택)
-BOOTSTRAP_ADMIN_KEY = ((st.secrets.get("ADMIN_BOOTSTRAP_KEY") if hasattr(st, "secrets") else None) or os.getenv("ADMIN_BOOTSTRAP_KEY", "")).strip()
+ADMIN_BOOTSTRAP_KEY = st.secrets.get("ADMIN_BOOTSTRAP_KEY", os.getenv("ADMIN_BOOTSTRAP_KEY", ""))
 
 # (4) Supabase (있으면 우선 사용)
-SUPABASE_URL = (st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_KEY")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 supabase = None
@@ -660,4 +660,5 @@ if bool(current_user.get("is_admin", False)):
                     st.rerun()
 else:
     st.sidebar.caption("관리자 권한이 없습니다.")
+
 
