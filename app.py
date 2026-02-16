@@ -1,525 +1,693 @@
-# app.py
 import os
-from datetime import datetime
-from typing import Optional, Tuple
+import re
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple, List
 
 import pandas as pd
 import streamlit as st
 
 # -----------------------------
-# Page config (must be first)
+# Page config
 # -----------------------------
-st.set_page_config(page_title="승인형 제안서 생성기 (업로드+비용방어)", layout="wide")
+st.set_page_config(page_title="승인형 성실신고/법인전환 보고서", layout="wide")
 
-
-# =========================================================
-# Secrets / Env helpers
-# =========================================================
-def get_secret(key: str, default: str = "") -> str:
-    # Streamlit Cloud: st.secrets, local: env
-    if hasattr(st, "secrets") and key in st.secrets:
-        return str(st.secrets.get(key, default))
+# -----------------------------
+# Secrets helpers
+# -----------------------------
+def sget(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
     return os.getenv(key, default)
 
+SUPABASE_URL = sget("SUPABASE_URL").strip()
+SUPABASE_KEY = sget("SUPABASE_KEY").strip()  # service_role 권장
+OPENAI_API_KEY = sget("OPENAI_API_KEY").strip()
 
-SUPABASE_URL = get_secret("SUPABASE_URL").strip()
-SUPABASE_KEY = get_secret("SUPABASE_KEY").strip()
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY").strip()
+ADMIN_EMAIL = sget("ADMIN_EMAIL", "").strip().lower()
+ADMIN_BOOTSTRAP_KEY = sget("ADMIN_BOOTSTRAP_KEY", "").strip()
 
-ADMIN_EMAIL = get_secret("ADMIN_EMAIL", "").strip().lower()
-ADMIN_BOOTSTRAP_KEY = get_secret("ADMIN_BOOTSTRAP_KEY", "").strip()
+DAILY_LIMIT = int(sget("DAILY_LIMIT", "5"))
+MONTHLY_LIMIT = int(sget("MONTHLY_LIMIT", "100"))
 
-# Usage limits
-DAILY_LIMIT = 5
-MONTHLY_LIMIT = 100
+OPENAI_MODEL = sget("OPENAI_MODEL", "gpt-4.1-mini").strip()  # 필요시 변경
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# =========================================================
-# Supabase client
-# =========================================================
-def get_supabase_client():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    try:
-        from supabase import create_client  # type: ignore
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        return None
-
-
-sb = get_supabase_client()
-
-
-# =========================================================
-# OpenAI call (robust)
-# =========================================================
-def call_openai_generate(text_prompt: str) -> str:
-    """
-    Uses OpenAI API. If quota/billing not set -> raises Exception.
-    """
-    if not OPENAI_API_KEY:
-        raise Exception("OPENAI_API_KEY가 설정되지 않았습니다.")
-
-    # Prefer official python SDK if available
-    try:
-        from openai import OpenAI  # type: ignore
-
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        # Responses API (recommended)
-        resp = client.responses.create(
-            model="gpt-4.1-mini",
-            input=text_prompt,
-        )
-        # Extract text safely
-        out = []
-        for item in resp.output:
-            if item.type == "message":
-                for c in item.content:
-                    if c.type == "output_text":
-                        out.append(c.text)
-        return "\n".join(out).strip() or "응답이 비어있습니다."
-    except Exception:
-        # Fallback to HTTP if SDK mismatch
-        import requests
-
-        r = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4.1-mini", "input": text_prompt},
-            timeout=60,
-        )
-        if r.status_code >= 400:
-            raise Exception(f"OpenAI 호출 실패: {r.status_code} / {r.text}")
-        data = r.json()
-        # Try to parse output text
-        out = []
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        out.append(c.get("text", ""))
-        return "\n".join(out).strip() or "응답이 비어있습니다."
-
-
-# =========================================================
-# Auth / Approval (Supabase: users table)
-# =========================================================
-def ensure_supabase_ready():
+def must_have_secrets():
     missing = []
-    if not SUPABASE_URL:
-        missing.append("SUPABASE_URL")
-    if not SUPABASE_KEY:
-        missing.append("SUPABASE_KEY")
+    if not SUPABASE_URL: missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY: missing.append("SUPABASE_KEY")
+    if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
+    if not ADMIN_BOOTSTRAP_KEY: missing.append("ADMIN_BOOTSTRAP_KEY")
     if missing:
-        st.error(
-            "Secrets 설정이 부족합니다.\n\n"
-            + "누락: " + ", ".join(missing)
-            + "\n\nStreamlit Cloud → Manage app → Settings → Secrets에 TOML로 넣어주세요."
-        )
-        st.stop()
-    if sb is None:
-        st.error("Supabase 클라이언트를 로드하지 못했습니다. requirements.txt에 supabase가 설치되어 있는지 확인하세요.")
+        st.error(f"Secrets 설정이 부족합니다.\n\n누락: {', '.join(missing)}")
         st.stop()
 
+must_have_secrets()
 
-def db_get_user(email: str) -> Optional[dict]:
-    res = sb.table("users").select("*").eq("email", email).execute()
-    if res.data:
-        return res.data[0]
+# -----------------------------
+# Supabase client
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def sb():
+    from supabase import create_client
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# -----------------------------
+# OpenAI client
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def oai():
+    from openai import OpenAI
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------
+# Utility
+# -----------------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def period_keys() -> Tuple[str, str]:
+    dt = now_utc()
+    return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m")
+
+def norm_email(x: str) -> str:
+    return (x or "").strip().lower()
+
+def valid_email(x: str) -> bool:
+    return bool(EMAIL_RE.match(norm_email(x)))
+
+def parse_money_kr(s: str) -> Optional[int]:
+    """
+    '8억', '10억', '1.2억', '900000000', '9억 5천' 같은 입력을 단순 파싱.
+    완벽하진 않지만 실무 입력에 충분히 유용.
+    """
+    if not s:
+        return None
+    t = str(s).strip().replace(",", "").replace("원", "").replace(" ", "")
+    if t.isdigit():
+        return int(t)
+
+    # 억/만 단위
+    # 예: 9억5천(=9.5억) 지원 간단화
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)억(?:([0-9]+)천)?$", t)
+    if m:
+        eok = float(m.group(1))
+        cheon = m.group(2)
+        val = eok * 100_000_000
+        if cheon:
+            val += int(cheon) * 10_000_000  # 1천(만) 단순화가 아니라 '천'이 애매하므로 1천=1천만으로 가정 X
+        return int(val)
+
+    m2 = re.match(r"^([0-9]+(?:\.[0-9]+)?)억$", t)
+    if m2:
+        return int(float(m2.group(1)) * 100_000_000)
+
+    # 만 단위
+    m3 = re.match(r"^([0-9]+(?:\.[0-9]+)?)만$", t)
+    if m3:
+        return int(float(m3.group(1)) * 10_000)
+
     return None
 
+def fmt_won(x: Optional[int]) -> str:
+    if x is None:
+        return "-"
+    return f"{x:,}원"
 
-def db_upsert_user(email: str, approved: Optional[bool] = None, is_admin: Optional[bool] = None):
-    payload = {"email": email}
-    if approved is not None:
-        payload["approved"] = approved
-    if is_admin is not None:
-        payload["is_admin"] = is_admin
-    sb.table("users").upsert(payload, on_conflict="email").execute()
+# -----------------------------
+# DB: users
+# -----------------------------
+def db_get_user(email: str) -> Optional[Dict[str, Any]]:
+    r = sb().table("users").select("*").eq("email", email).limit(1).execute()
+    data = r.data or []
+    return data[0] if data else None
 
+def db_create_user_if_missing(email: str) -> Dict[str, Any]:
+    u = db_get_user(email)
+    if u:
+        return u
+    payload = {
+        "email": email,
+        "approved": False,
+        "is_admin": False,
+        "created_at": now_utc().isoformat(),
+    }
+    sb().table("users").insert(payload).execute()
+    return db_get_user(email) or payload
 
-def db_list_users():
-    return sb.table("users").select("*").order("created_at", desc=True).execute().data or []
+def db_list_users() -> List[Dict[str, Any]]:
+    r = sb().table("users").select("*").order("created_at", desc=True).execute()
+    return r.data or []
 
+def db_set_approved(email: str, approved: bool):
+    sb().table("users").update({"approved": bool(approved)}).eq("email", email).execute()
 
-def db_set_approval(email: str, approved: bool):
-    sb.table("users").update({"approved": approved}).eq("email", email).execute()
+def db_set_admin(email: str, is_admin: bool):
+    sb().table("users").update({"is_admin": bool(is_admin)}).eq("email", email).execute()
 
-
-# =========================================================
-# Usage counters (Supabase: usage_counters table)
-# - upsert 기반(중복키 방지)
-# - 첫 사용 자동 생성
-# =========================================================
-def get_period_keys() -> Tuple[str, str]:
-    now = datetime.utcnow()
-    daily_key = now.strftime("%Y-%m-%d")
-    monthly_key = now.strftime("%Y-%m")
-    return daily_key, monthly_key
-
-
-def get_usage(email: str, period_type: str, period_key: str) -> int:
-    res = (
-        sb.table("usage_counters")
+# -----------------------------
+# DB: usage_counters (중복키 방지 upsert)
+# -----------------------------
+def usage_get(email: str, period_type: str, period_key: str) -> int:
+    r = (
+        sb()
+        .table("usage_counters")
         .select("used_count")
         .eq("email", email)
         .eq("period_type", period_type)
         .eq("period_key", period_key)
+        .limit(1)
         .execute()
     )
-    if res.data:
-        return int(res.data[0].get("used_count", 0))
-    return 0
+    data = r.data or []
+    return int(data[0]["used_count"]) if data else 0
 
+def usage_inc(email: str) -> Dict[str, int]:
+    daily_key, monthly_key = period_keys()
+    # upsert로 "첫 사용 자동 생성 + 중복키 방지"
+    d_now = usage_get(email, "daily", daily_key)
+    m_now = usage_get(email, "monthly", monthly_key)
 
-def check_limits(email: str) -> Tuple[bool, str, int, int]:
-    daily_key, monthly_key = get_period_keys()
-    daily_used = get_usage(email, "daily", daily_key)
-    monthly_used = get_usage(email, "monthly", monthly_key)
+    sb().table("usage_counters").upsert(
+        {
+            "email": email,
+            "period_type": "daily",
+            "period_key": daily_key,
+            "used_count": d_now + 1,
+            "created_at": now_utc().isoformat(),
+            "updated_at": now_utc().isoformat(),
+        },
+        on_conflict="email,period_type,period_key",
+    ).execute()
 
-    if daily_used >= DAILY_LIMIT:
-        return False, "오늘 사용 한도를 초과했습니다.", daily_used, monthly_used
-    if monthly_used >= MONTHLY_LIMIT:
-        return False, "이번 달 사용 한도를 초과했습니다.", daily_used, monthly_used
-    return True, "", daily_used, monthly_used
+    sb().table("usage_counters").upsert(
+        {
+            "email": email,
+            "period_type": "monthly",
+            "period_key": monthly_key,
+            "used_count": m_now + 1,
+            "created_at": now_utc().isoformat(),
+            "updated_at": now_utc().isoformat(),
+        },
+        on_conflict="email,period_type,period_key",
+    ).execute()
 
+    return {"daily_used": d_now + 1, "monthly_used": m_now + 1}
 
-def increment_usage_safe(email: str):
-    """
-    경쟁 조건에서도 'duplicate key' 에러가 나면 재시도하는 방식으로 안전하게 처리.
-    (완전 원자적 increment는 RPC가 필요하지만, 이 정도면 실사용에 충분히 안정적)
-    """
-    daily_key, monthly_key = get_period_keys()
+def quota_status(email: str) -> Dict[str, Any]:
+    daily_key, monthly_key = period_keys()
+    d = usage_get(email, "daily", daily_key)
+    m = usage_get(email, "monthly", monthly_key)
+    return {
+        "daily_key": daily_key,
+        "monthly_key": monthly_key,
+        "daily_used": d,
+        "monthly_used": m,
+        "daily_limit": DAILY_LIMIT,
+        "monthly_limit": MONTHLY_LIMIT,
+        "daily_remain": max(0, DAILY_LIMIT - d),
+        "monthly_remain": max(0, MONTHLY_LIMIT - m),
+    }
 
-    for _ in range(2):
+def ensure_quota(email: str):
+    q = quota_status(email)
+    if q["daily_used"] >= DAILY_LIMIT:
+        st.error("오늘 사용 한도를 초과했습니다.")
+        st.stop()
+    if q["monthly_used"] >= MONTHLY_LIMIT:
+        st.error("이번 달 사용 한도를 초과했습니다.")
+        st.stop()
+
+# -----------------------------
+# Excel: 소득율 계산 (두 가지 레이아웃 지원)
+#  A) 원본형: F(표준산업분류) -> C(업종코드) -> K(업종코드) -> Q(Q값)
+#  B) 현재 업로드 파일형: '표준산업 분류' + '업종코드' + '단순경비율(일반율)'
+# -----------------------------
+def compute_income_rate(df: pd.DataFrame, industry_code: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    code = str(industry_code).strip()
+
+    cols = [str(c) for c in df.columns]
+
+    # --- B) 현재 파일형 탐지
+    # 표준산업 분류 / 단순경비율(일반율) / 업종코드 같은 컬럼명 존재
+    col_std = None
+    col_rate = None
+    col_biz = None
+
+    for c in df.columns:
+        s = str(c)
+        if "표준산업" in s and "분류" in s:
+            col_std = c
+        if "단순경비율" in s:
+            col_rate = c
+        if s.strip() == "업종코드" or "귀속" in s and "업종코드" in s:
+            # 우선순위: 정확히 '업종코드'
+            if str(c).strip() == "업종코드":
+                col_biz = c
+
+    if col_std is not None and col_rate is not None:
+        # 표준산업분류에서 매칭
+        m = df[df[col_std].astype(str).str.strip() == code]
+        if m.empty:
+            return None, f"표준산업분류 컬럼에서 '{code}'를 찾지 못했습니다."
+        row = m.iloc[0]
+        biz_code = str(row[col_biz]).strip() if col_biz is not None else ""
+        q_like = row[col_rate]
         try:
-            # DAILY
-            daily_now = get_usage(email, "daily", daily_key)
-            sb.table("usage_counters").upsert(
-                {
-                    "email": email,
-                    "period_type": "daily",
-                    "period_key": daily_key,
-                    "used_count": daily_now + 1,
-                },
-                on_conflict="email,period_type,period_key",
-            ).execute()
-
-            # MONTHLY
-            monthly_now = get_usage(email, "monthly", monthly_key)
-            sb.table("usage_counters").upsert(
-                {
-                    "email": email,
-                    "period_type": "monthly",
-                    "period_key": monthly_key,
-                    "used_count": monthly_now + 1,
-                },
-                on_conflict="email,period_type,period_key",
-            ).execute()
-            return
+            q_val = float(q_like)
         except Exception:
-            # 재시도
-            continue
+            return None, f"단순경비율 값이 숫자가 아닙니다: {q_like}"
 
-    raise Exception("사용량 증가 처리 중 오류가 발생했습니다(재시도 실패).")
+        income_rate = 100.0 - q_val
+        return {
+            "industry_code": code,
+            "biz_code": biz_code,
+            "q_value": q_val,
+            "income_rate": income_rate,
+            "source": "단순경비율(일반율) 기반(소득율=100-단순경비율)",
+        }, "OK"
 
+    # --- A) 원본형(열 위치 기반) 시도
+    # 최소 17열 이상 필요(Q=17번째=인덱스16)
+    if len(df.columns) >= 17:
+        col_C = df.columns[2]   # C
+        col_F = df.columns[5]   # F
+        col_K = df.columns[10]  # K
+        col_Q = df.columns[16]  # Q
 
-# =========================================================
-# Excel upload → realtime calculation
-# 요구: 업종코드(산업분류코드) 입력
-# - F열에서 산업분류코드 찾기
-# - 같은 행의 C열 = 업종코드(biz_code)
-# - K열에서 업종코드 찾기
-# - 같은 행의 Q열 = Q값
-# - 소득율 = 100 - Q값
-# =========================================================
-def compute_income_rate_from_excel(df: pd.DataFrame, industry_code: str) -> Tuple[Optional[float], str]:
+        f = df[col_F].astype(str).str.strip()
+        m1 = df[f == code]
+        if m1.empty:
+            return None, f"F열(6번째 컬럼)에서 산업분류코드 '{code}'를 찾지 못했습니다."
+        biz_code = str(m1.iloc[0][col_C]).strip()
+
+        k = df[col_K].astype(str).str.strip()
+        m2 = df[k == biz_code]
+        if m2.empty:
+            return None, f"K열(11번째 컬럼)에서 업종코드 '{biz_code}'를 찾지 못했습니다."
+        q_raw = m2.iloc[0][col_Q]
+        try:
+            q_val = float(q_raw)
+        except Exception:
+            return None, f"Q열 값이 숫자가 아닙니다: {q_raw}"
+
+        income_rate = 100.0 - q_val
+        return {
+            "industry_code": code,
+            "biz_code": biz_code,
+            "q_value": q_val,
+            "income_rate": income_rate,
+            "source": "원본형(F→C→K→Q) 기반(소득율=100-Q)",
+        }, "OK"
+
+    return None, "엑셀 컬럼 구조를 인식하지 못했습니다. (표준산업분류/단순경비율 파일 또는 원본형 F/C/K/Q 파일을 사용하세요.)"
+
+# -----------------------------
+# Tax calc (간이)
+#  - 종합소득세: 2023~2024 귀속 구간(국세청 표 기준)을 코드에 내장
+#  - 지방소득세: 산출세액의 10% 가산
+# -----------------------------
+INCOME_TAX_BRACKETS = [
+    (14_000_000, 0.06, 0),
+    (50_000_000, 0.15, 1_260_000),
+    (88_000_000, 0.24, 5_760_000),
+    (150_000_000, 0.35, 15_440_000),
+    (300_000_000, 0.38, 19_940_000),
+    (500_000_000, 0.40, 25_940_000),
+    (1_000_000_000, 0.42, 35_940_000),
+    (10_000_000_000_000, 0.45, 65_940_000),
+]
+
+def calc_income_tax(pretax_income: int) -> Dict[str, int]:
     """
-    Returns (income_rate, message)
+    매우 단순화: 필요경비/공제 등 미반영.
+    과세표준=순이익 가정.
     """
-    # Excel 컬럼이 A,B,C... 형태로 들어오는 경우 대비:
-    # pandas는 컬럼명이 실제 헤더 행에 따라 달라짐.
-    # 여기서는 "열 위치" 기반으로 처리 (C=3, F=6, K=11, Q=17) -> 1-index 기준
-    # 0-index로는: C=2, F=5, K=10, Q=16
-    try:
-        col_C = df.columns[2]
-        col_F = df.columns[5]
-        col_K = df.columns[10]
-        col_Q = df.columns[16]
-    except Exception:
-        return None, "엑셀 형식이 예상과 다릅니다. 최소 Q열(17번째 컬럼)까지 존재해야 합니다."
+    x = max(0, int(pretax_income))
+    rate = 0.0
+    deduct = 0
+    for limit, r, d in INCOME_TAX_BRACKETS:
+        if x <= limit:
+            rate = r
+            deduct = d
+            break
+    national = int(x * rate - deduct)
+    local = int(national * 0.10)
+    total = national + local
+    return {"national": max(0, national), "local": max(0, local), "total": max(0, total)}
 
-    # F열에서 산업분류코드 찾기
-    # 숫자로 들어오든 문자열로 들어오든 매칭되게 처리
-    target = str(industry_code).strip()
-    f_series = df[col_F].astype(str).str.strip()
+def risk_level_faithful_filing(category: str, revenue: int) -> Tuple[str, int]:
+    """
+    국세청 기준(요청하신 구간):
+    - 도소매 15억
+    - 제조/건설 등 7.5억
+    - 서비스/부동산임대 5억
+    """
+    cat = category
+    thr = 0
+    if cat == "도소매":
+        thr = 1_500_000_000
+    elif cat in ("제조", "건설"):
+        thr = 750_000_000
+    else:
+        thr = 500_000_000
 
-    matches = df[f_series == target]
-    if matches.empty:
-        return None, f"F열에서 산업분류코드 '{target}'를 찾지 못했습니다."
+    if revenue < thr * 0.8:
+        return "낮음", thr
+    if revenue < thr:
+        return "보통", thr
+    if revenue < thr * 1.2:
+        return "높음", thr
+    return "매우 높음", thr
 
-    biz_code = str(matches.iloc[0][col_C]).strip()
-    if not biz_code or biz_code.lower() == "nan":
-        return None, "C열 업종코드를 가져오지 못했습니다."
+def cost_denial_simulation(revenue: int) -> List[Dict[str, Any]]:
+    """
+    보수적 비율(요청하신 제조업 예시의 '하단' 사용)
+    """
+    items = [
+        ("외주가공비", 0.02),
+        ("가족·특수관계인 인건비", 0.01),
+        ("차량·접대 등 사적경비", 0.01),
+        ("무증빙·현금지출", 0.005),
+    ]
+    out = []
+    for name, pct in items:
+        denied = int(revenue * pct)
+        out.append({"item": name, "pct": pct, "denied": denied})
+    return out
 
-    # K열에서 업종코드 찾기
-    k_series = df[col_K].astype(str).str.strip()
-    matches2 = df[k_series == biz_code]
-    if matches2.empty:
-        return None, f"K열에서 업종코드 '{biz_code}'를 찾지 못했습니다."
+def estimate_health_ins_increase(additional_income: int) -> int:
+    """
+    건강보험은 실제로 소득/재산/자동차 등 복합. 여기서는 '추정'으로
+    추가 소득의 7%를 연간 증가분으로 매우 보수적 추정(설명용).
+    """
+    return int(max(0, additional_income) * 0.07)
 
-    q_raw = matches2.iloc[0][col_Q]
-    try:
-        q_val = float(q_raw)
-    except Exception:
-        return None, f"Q열 값이 숫자가 아닙니다: {q_raw}"
-
-    income_rate = 100.0 - q_val
-    return income_rate, f"업종코드={biz_code}, Q값={q_val} → 소득율={income_rate:.2f}%"
-
-
-# =========================================================
+# -----------------------------
 # UI
-# =========================================================
-st.title("✅ 승인형 제안서 생성기 (엑셀 업로드 + 비용 방어)")
-st.caption("승인된 사용자만 사용 가능 / 하루 5회 / 월 100회 / 업종코드 엑셀 업로드 후 실시간 계산")
+# -----------------------------
+st.title("✅ 개인사업자 성실신고 리스크 및 법인전환 전략 분석 AI (업로드 포함)")
+st.caption("승인된 사용자만 사용 / 하루 5회 / 월 100회 / 엑셀 업로드로 소득율 자동 산출 + 5년 리스크 보고서 생성")
 
+# Session
+if "email" not in st.session_state:
+    st.session_state.email = ""
+if "user" not in st.session_state:
+    st.session_state.user = None
 
-# --- Check Supabase required
-ensure_supabase_ready()
+def refresh_user():
+    if st.session_state.email:
+        st.session_state.user = db_get_user(st.session_state.email)
 
-# --- Session state
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_email" not in st.session_state:
-    st.session_state.user_email = ""
-if "user_info" not in st.session_state:
-    st.session_state.user_info = None
-
-# --- Sidebar: login
+# Sidebar login
 with st.sidebar:
     st.header("🔐 접근 제어")
 
-    email_input = st.text_input("이메일", value=st.session_state.user_email or "", placeholder="name@example.com").strip().lower()
-
-    colA, colB = st.columns(2)
-    with colA:
+    email_in = st.text_input("이메일", value=st.session_state.email, placeholder="name@example.com")
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("로그인", use_container_width=True):
-            if not email_input:
-                st.warning("이메일을 입력하세요.")
+            e = norm_email(email_in)
+            if not valid_email(e):
+                st.warning("이메일 형식이 올바르지 않습니다.")
             else:
-                # ensure user exists
-                u = db_get_user(email_input)
-                if u is None:
-                    # 최초 로그인: 자동 생성(승인 대기)
-                    db_upsert_user(email_input, approved=False, is_admin=False)
-                    u = db_get_user(email_input)
-
-                st.session_state.logged_in = True
-                st.session_state.user_email = email_input
-                st.session_state.user_info = u
-                st.success(f"로그인: {email_input}")
-
-    with colB:
+                st.session_state.email = e
+                db_create_user_if_missing(e)
+                refresh_user()
+                st.rerun()
+    with c2:
         if st.button("로그아웃", use_container_width=True):
-            st.session_state.logged_in = False
-            st.session_state.user_email = ""
-            st.session_state.user_info = None
-            st.info("로그아웃 되었습니다.")
+            st.session_state.email = ""
+            st.session_state.user = None
+            st.rerun()
 
-    if st.session_state.logged_in and st.session_state.user_info:
-        u = db_get_user(st.session_state.user_email)  # refresh
-        st.session_state.user_info = u
+    refresh_user()
+    if st.session_state.user:
+        u = st.session_state.user
+        st.success(f"로그인: {u['email']}")
+        st.write(f"승인: {'✅' if u.get('approved') else '⏳ 승인대기'}")
+        st.write(f"관리자: {'👑' if u.get('is_admin') else '-'}")
 
-        st.write(f"로그인: **{st.session_state.user_email}**")
-        st.write(f"승인: {'✅' if u.get('approved') else '⏳ 대기'}")
-        st.write(f"관리자: {'👑' if u.get('is_admin') else '—'}")
+        q = quota_status(u["email"])
+        st.caption("📌 사용량(비용 방어)")
+        st.write(f"- 오늘({q['daily_key']}): {q['daily_used']} / {q['daily_limit']} (잔여 {q['daily_remain']})")
+        st.write(f"- 이번달({q['monthly_key']}): {q['monthly_used']} / {q['monthly_limit']} (잔여 {q['monthly_remain']})")
 
-        ok, msg, daily_used, monthly_used = check_limits(st.session_state.user_email)
-        st.markdown("### 📌 사용량(비용 방어)")
-        st.write(f"- 오늘({datetime.utcnow().strftime('%Y-%m-%d')}): {daily_used} / {DAILY_LIMIT} (잔여 {max(0, DAILY_LIMIT-daily_used)})")
-        st.write(f"- 이달({datetime.utcnow().strftime('%Y-%m')}): {monthly_used} / {MONTHLY_LIMIT} (잔여 {max(0, MONTHLY_LIMIT-monthly_used)})")
-
-    # --- Admin bootstrap (최초 1회)
     st.divider()
     with st.expander("🛠 관리자 초기설정(최초 1회)"):
-        st.caption("Secrets의 ADMIN_BOOTSTRAP_KEY를 아는 사람만 관리자 지정 가능")
-        bootstrap_key = st.text_input("ADMIN_BOOTSTRAP_KEY", type="password", placeholder="Secrets에 넣은 값", key="bootstrap_key_input")
-        admin_email = st.text_input("ADMIN_EMAIL(관리자 이메일)", value=ADMIN_EMAIL or "", placeholder="example@gmail.com").strip().lower()
-
+        st.caption("ADMIN_BOOTSTRAP_KEY가 맞으면 해당 이메일을 관리자+승인 처리합니다.")
+        boot_key = st.text_input("ADMIN_BOOTSTRAP_KEY", type="password")
+        admin_email = st.text_input("관리자 이메일", value=ADMIN_EMAIL or "", placeholder="admin@example.com").strip().lower()
         if st.button("관리자 계정 생성/갱신", use_container_width=True):
-            if not admin_email:
-                st.error("ADMIN_EMAIL이 비어있습니다. Secrets에 ADMIN_EMAIL을 넣거나 여기 입력하세요.")
-            elif not ADMIN_BOOTSTRAP_KEY:
-                st.error("Secrets에 ADMIN_BOOTSTRAP_KEY가 없습니다.")
-            elif bootstrap_key != ADMIN_BOOTSTRAP_KEY:
-                st.error("ADMIN_BOOTSTRAP_KEY가 틀렸습니다.")
+            if boot_key != ADMIN_BOOTSTRAP_KEY:
+                st.error("키가 일치하지 않습니다.")
+            elif not valid_email(admin_email):
+                st.error("관리자 이메일 형식이 올바르지 않습니다.")
             else:
-                # Make admin approved + admin
-                db_upsert_user(admin_email, approved=True, is_admin=True)
-                st.success("관리자 계정을 승인+관리자로 설정했습니다. (이제 관리자 이메일로 로그인하면 관리 화면이 열립니다.)")
+                db_create_user_if_missing(admin_email)
+                db_set_approved(admin_email, True)
+                db_set_admin(admin_email, True)
+                st.success("관리자 설정 완료!")
+                st.rerun()
 
-
-# --- Gate: must login
-if not st.session_state.logged_in or not st.session_state.user_info:
-    st.info("왼쪽 사이드바에서 이메일로 로그인하세요. (최초 로그인 시 자동 등록되며 ‘승인 대기’가 됩니다.)")
+# Gate
+if not st.session_state.user:
+    st.info("왼쪽 사이드바에서 이메일로 로그인하세요.")
     st.stop()
 
-# --- Gate: must approved
-user = st.session_state.user_info
-if not user.get("approved", False):
-    st.warning("현재 ‘승인 대기’ 상태입니다. 관리자가 승인해야 사용할 수 있습니다.")
+user = st.session_state.user
+if not user.get("approved") and not user.get("is_admin"):
+    st.warning("등록되었습니다. 관리자 승인 대기 중입니다.")
     st.stop()
 
-
-# =========================================================
-# Main: Excel upload + realtime calc + proposal generation
-# =========================================================
-left, right = st.columns([1.0, 1.2], gap="large")
-
-with left:
-    st.subheader("1) 엑셀 업로드 → 실시간 계산")
-
-    uploaded_file = st.file_uploader("업종코드 엑셀 업로드 (.xlsx)", type=["xlsx"])
-    industry_code = st.text_input("산업분류코드 입력 (F열에서 찾음)", placeholder="예: 22232")
-
-    df_excel = None
-    if uploaded_file is not None:
-        try:
-            df_excel = pd.read_excel(uploaded_file)
-            st.success(f"업로드 성공: {uploaded_file.name}  (행 {len(df_excel):,} / 열 {len(df_excel.columns):,})")
-            with st.expander("미리보기(상위 20행)"):
-                st.dataframe(df_excel.head(20), use_container_width=True)
-        except Exception as e:
-            st.error(f"엑셀 읽기 실패: {e}")
-            df_excel = None
-
-    income_rate = None
-    income_msg = ""
-    if df_excel is not None and industry_code.strip():
-        income_rate, income_msg = compute_income_rate_from_excel(df_excel, industry_code.strip())
-        if income_rate is None:
-            st.error(income_msg)
-        else:
-            st.success(income_msg)
-
+# Admin panel
+if user.get("is_admin"):
+    st.subheader("👑 관리자: 사용자 승인/관리")
+    users = db_list_users()
+    if users:
+        st.dataframe(
+            [{"email": u["email"], "approved": u.get("approved"), "is_admin": u.get("is_admin"), "created_at": u.get("created_at")} for u in users],
+            use_container_width=True,
+        )
+    tgt = st.text_input("대상 이메일(승인/해제)", key="tgt_email").strip().lower()
+    a1, a2 = st.columns(2)
+    with a1:
+        if st.button("✅ 승인", use_container_width=True):
+            if valid_email(tgt):
+                db_create_user_if_missing(tgt)
+                db_set_approved(tgt, True)
+                st.success("승인 완료")
+                st.rerun()
+            else:
+                st.error("이메일이 올바르지 않습니다.")
+    with a2:
+        if st.button("⛔ 승인 해제", use_container_width=True):
+            if valid_email(tgt):
+                db_set_approved(tgt, False)
+                st.success("승인 해제 완료")
+                st.rerun()
+            else:
+                st.error("이메일이 올바르지 않습니다.")
     st.divider()
-    st.subheader("2) 제안서 입력(예시)")
-    last_sales = st.text_input("직전년도 매출(예: 9억)", value="")
-    this_sales = st.text_input("금년도 예상 매출(예: 11억)", value="")
-    employees = st.number_input("직원 수(대표 제외)", min_value=0, step=1, value=5)
-    worries = st.text_area("현재 고민/리스크(선택)", value="성실신고, 건강보험료, 비용처리 리스크")
 
-    tone = st.selectbox("문서 톤", ["전문적/숫자중심/리스크체감형", "간결/설득형", "강하게/경고형"], index=0)
+# Main inputs
+st.subheader("📎 1) 기준 엑셀 업로드")
+uploaded = st.file_uploader("업종코드 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
-with right:
-    st.subheader("3) 승인된 사용자만 제안서 생성 + 사용량 제한(비용방어)")
+st.subheader("🧾 2) 입력")
+industry_code = st.text_input("산업분류코드(숫자 그대로)", placeholder="예: 25913")
+last_sales_s = st.text_input("작년 매출", placeholder="예: 8억")
+this_sales_s = st.text_input("금년 예상 매출", placeholder="예: 10억")
+employees = st.number_input("직원 수(대표 제외)", min_value=0, step=1, value=6)
 
-    # show remaining
-    ok, msg, daily_used, monthly_used = check_limits(st.session_state.user_email)
-    st.write(f"오늘 잔여: **{max(0, DAILY_LIMIT-daily_used)}회** / 이달 잔여: **{max(0, MONTHLY_LIMIT-monthly_used)}회**")
+category = st.selectbox("업종 분류(성실신고 기준용)", ["제조", "도소매", "건설", "서비스"], index=0)
 
-    if st.button("🚀 제안서 생성(OpenAI)", use_container_width=True):
-        # limit check
-        ok, msg, _, _ = check_limits(st.session_state.user_email)
-        if not ok:
+# Parse money
+last_sales = parse_money_kr(last_sales_s)
+this_sales = parse_money_kr(this_sales_s)
+
+# Excel reading + income rate
+income_pack = None
+if uploaded is not None and industry_code.strip():
+    try:
+        df = pd.read_excel(uploaded)
+        income_pack, msg = compute_income_rate(df, industry_code.strip())
+        if income_pack is None:
             st.error(msg)
-            st.stop()
-
-        # increment first (cost defense: 실패해도 카운트할지 정책 선택 가능)
-        # 여기서는 "호출 시도" 자체를 비용으로 보고 선차감.
-        try:
-            increment_usage_safe(st.session_state.user_email)
-        except Exception as e:
-            st.error(f"사용량 처리 실패: {e}")
-            st.stop()
-
-        # Build prompt
-        calc_part = ""
-        if income_rate is not None:
-            calc_part = f"- 업로드 엑셀 기준 소득율(100-Q): {income_rate:.2f}%\n"
         else:
-            calc_part = "- 업로드 엑셀 기준 소득율: (미계산)\n"
+            st.success(f"소득율 산출 성공 ({income_pack['source']})")
+            st.write({
+                "산업분류코드": income_pack["industry_code"],
+                "업종코드": income_pack.get("biz_code", ""),
+                "Q값(또는 단순경비율)": income_pack["q_value"],
+                "소득율(%)": round(income_pack["income_rate"], 2),
+            })
+    except Exception as e:
+        st.error(f"엑셀 읽기 실패: {e}")
 
-        prompt = f"""
-당신은 한국의 법인전환/세무 리스크 컨설팅 제안서 작성 전문가입니다.
-아래 입력을 바탕으로 '컨설팅 제안서'를 한국어로 작성하세요.
-숫자/리스크/대안/실행로드맵/기대효과/다음액션을 포함하고, 과장하지 말고 현실적 근거로 설득하세요.
+st.divider()
+st.subheader("📝 3) 보고서 생성 (승인된 사용자만 / 사용량 제한 적용)")
 
-[사용자 입력]
-- 직전년도 매출: {last_sales}
-- 금년도 예상 매출: {this_sales}
-- 직원 수(대표 제외): {employees}
-- 산업분류코드: {industry_code}
-{calc_part}
-- 현재 고민/리스크: {worries}
-- 문서 톤: {tone}
+btn = st.button("🚀 보고서 생성(OpenAI)", type="primary", use_container_width=True)
 
-[출력 형식]
-1) 요약(핵심 5줄)
-2) 현재 리스크 진단(세무/건보/성실신고/조사리스크 관점)
-3) 법인전환 필요성(왜 지금)
-4) 실행 방안(단계별 체크리스트)
-5) 예상 효과(정량/정성)
-6) 필요 자료 요청 목록
-7) 컨설팅 범위/일정(샘플)
-8) 면책/유의사항(간단)
+if btn:
+    # Input validation
+    if income_pack is None:
+        st.error("엑셀 업로드 + 산업분류코드 입력 후 소득율 산출을 먼저 완료하세요.")
+        st.stop()
+    if last_sales is None or this_sales is None:
+        st.error("매출 입력 형식을 확인하세요. (예: 8억, 10억 또는 숫자)")
+        st.stop()
 
-주의: 숫자는 사용자가 준 값만 사용하고, 추정치가 필요하면 '추정'임을 명확히 표시.
+    # Quota check
+    ensure_quota(user["email"])
+
+    # ---- Deterministic calculations (숫자 기반) ----
+    income_rate = float(income_pack["income_rate"]) / 100.0
+    last_profit = int(last_sales * income_rate)
+    this_profit = int(this_sales * income_rate)
+
+    tax_last = calc_income_tax(last_profit)
+    tax_this = calc_income_tax(this_profit)
+
+    # +1% / -1% sensitivity
+    up_profit = int(this_sales * ((income_rate + 0.01)))
+    dn_profit = int(this_sales * max(0, (income_rate - 0.01)))
+    tax_up = calc_income_tax(up_profit)
+    tax_dn = calc_income_tax(dn_profit)
+
+    risk, threshold = risk_level_faithful_filing(category, this_sales)
+
+    # 비용 부인 시뮬 (성실신고 대상 위험이 '보통' 이상이면 가정)
+    denial_items = cost_denial_simulation(this_sales)
+    denial_rows = []
+    total_denied = 0
+    total_add_tax = 0
+    total_add_health = 0
+
+    for it in denial_items:
+        denied = it["denied"]
+        add_income = denied
+        add_tax = calc_income_tax(this_profit + add_income)["total"] - tax_this["total"]
+        add_health = estimate_health_ins_increase(add_income)
+
+        denial_rows.append({
+            "항목": it["item"],
+            "가정비율": f"{int(it['pct']*1000)/10:.1f}%",
+            "가정 비용부인 금액": denied,
+            "증가 과세소득": add_income,
+            "추가 종합소득세+지방세(추정)": add_tax,
+            "건강보험 증가(연, 추정)": add_health,
+        })
+        total_denied += denied
+        total_add_tax += add_tax
+        total_add_health += add_health
+
+    # 3년/5년 누적(단순 누적: 동일 조건 반복)
+    base_3y = (tax_this["total"] + 0) * 3  # 건보는 별도 추정치를 넣고 싶으면 여기에 추가
+    add_3y = (total_add_tax + total_add_health) * 3
+    add_5y = (total_add_tax + total_add_health) * 5
+
+    # 법인 전환 비교(단순화: 법인세 9% 가정, 대표급여 6,500만원 가정)
+    ceo_salary = 65_000_000
+    corp_tax = int(max(0, this_profit) * 0.09)  # 단순화
+    # (건보 직장가입 효과는 실제 급여/사업장 구조에 따라 달라 '정성'으로만 언급)
+
+    # 사용량 차감(성공적으로 생성 시도할 때 1회)
+    usage_inc(user["email"])
+
+    # ---- OpenAI prompt (어제처럼 “보고서 구조+5년치” 강제) ----
+    denial_table_md = "|항목|가정비율|비용부인|과세소득증가|추가세금(추정)|건보증가(연,추정)|\n|---|---:|---:|---:|---:|---:|\n"
+    for r in denial_rows:
+        denial_table_md += f"|{r['항목']}|{r['가정비율']}|{r['가정 비용부인 금액']:,}|{r['증가 과세소득']:,}|{r['추가 종합소득세+지방세(추정)']:,}|{r['건강보험 증가(연, 추정)']:,}|\n"
+
+    prompt = f"""
+너는 “개인사업자 성실신고 리스크 및 법인전환 전략 분석 AI”다.
+반드시 숫자 중심, 과장 금지, 상담에 바로 쓰는 제안서 톤으로 작성한다.
+
+[입력/산출값(계산 완료)]
+- 산업분류코드: {income_pack['industry_code']}
+- 업종코드: {income_pack.get('biz_code','')}
+- Q값(또는 단순경비율): {income_pack['q_value']}
+- 소득율(%): {income_pack['income_rate']:.2f}
+
+- 작년 매출: {last_sales:,}원
+- 금년 매출: {this_sales:,}원
+- 직원수(대표 제외): {employees}명
+- 업종분류(성실신고 기준): {category}
+
+[순이익 추정]
+- 작년 순이익: {last_profit:,}원
+- 금년 순이익: {this_profit:,}원
+
+[종합소득세(추정)]
+- 작년 세금(국세): {tax_last['national']:,}원 / 지방세: {tax_last['local']:,}원 / 합계: {tax_last['total']:,}원
+- 금년 세금(국세): {tax_this['national']:,}원 / 지방세: {tax_this['local']:,}원 / 합계: {tax_this['total']:,}원
+
+[민감도(소득율 ±1%)]
+- 소득율 +1% 시 세금(합계): {tax_up['total']:,}원 (증가분: {(tax_up['total']-tax_this['total']):,}원)
+- 소득율 -1% 시 세금(합계): {tax_dn['total']:,}원 (감소분: {(tax_this['total']-tax_dn['total']):,}원)
+
+[성실신고확인대상 위험]
+- 기준 매출: {threshold:,}원
+- 금년 매출: {this_sales:,}원
+- 위험도: {risk}
+
+[비용 부인 시뮬레이션(보수적 가정)]
+- 총 비용부인 가정: {total_denied:,}원
+- 총 추가세금(추정): {total_add_tax:,}원
+- 총 건보 증가(연, 추정): {total_add_health:,}원
+
+{denial_table_md}
+
+[누적 리스크(단순 누적)]
+- 3년 누적 증가분(세금+건보): {add_3y:,}원
+- 5년 누적 증가분(세금+건보): {add_5y:,}원
+
+[법인 전환 단순 비교]
+- 법인세(단순 9% 가정, 금년 순이익 기준): {corp_tax:,}원
+- 대표 급여 가정: {ceo_salary:,}원
+
+[보고서 출력 순서(반드시 지킬 것)]
+1) 소득율 산출 결과(표로)
+2) 순이익 추정
+3) 종합소득세 계산(지방세 포함, 민감도 포함)
+4) 성실신고 대상 여부 판단(기준과 비교, 위험도)
+5) 비용 부인 시뮬레이션(항목별 표 + “비용 1억 정리 시 세금 약 ○○원 증가” 구조로 설명)
+6) 3년 누적 리스크 + 5년 누적 가능성(숫자 명확히)
+7) 법인 전환 비교(개인 유지 vs 정리 후 vs 법인전환) 간단 비교표
+8) 전략적 결론(실행 체크리스트)
+9) 1차 미팅 클로징 멘트(자연스럽게)
+
+주의:
+- 위 숫자는 그대로 사용하고, 추가 추정이 필요하면 “추정”이라고 표시.
+- 건강보험은 실제로 재산/자동차 등 반영되므로 “추정치”임을 명시.
 """.strip()
 
-        try:
-            result = call_openai_generate(prompt)
-            st.success("생성 완료")
-            st.text_area("생성된 제안서", value=result, height=520)
-        except Exception as e:
-            st.error(str(e))
-
-    st.caption("※ OpenAI 429 insufficient_quota가 뜨면 OpenAI 결제/크레딧(카드등록)이 안 된 상태입니다.")
-
-
-# =========================================================
-# Admin panel (approve users, view usage)
-# =========================================================
-if user.get("is_admin", False):
-    st.divider()
-    st.header("👑 관리자: 승인/사용량 관리")
-
-    users = db_list_users()
-    if not users:
-        st.info("등록된 사용자가 없습니다.")
-    else:
-        st.subheader("승인 대기/승인 사용자 목록")
-        dfu = pd.DataFrame(users)
-        st.dataframe(dfu, use_container_width=True)
-
-        st.subheader("승인 변경")
-        target_email = st.text_input("대상 이메일", placeholder="승인/해제할 이메일").strip().lower()
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ 승인", use_container_width=True):
-                if not target_email:
-                    st.warning("이메일을 입력하세요.")
-                else:
-                    db_set_approval(target_email, True)
-                    st.success(f"승인 완료: {target_email}")
-        with c2:
-            if st.button("⛔ 승인 해제", use_container_width=True):
-                if not target_email:
-                    st.warning("이메일을 입력하세요.")
-                else:
-                    db_set_approval(target_email, False)
-                    st.success(f"승인 해제: {target_email}")
-
-    st.subheader("사용량 카운터(최근)")
     try:
-        usage_rows = sb.table("usage_counters").select("*").order("updated_at", desc=True).limit(200).execute().data or []
-        if usage_rows:
-            st.dataframe(pd.DataFrame(usage_rows), use_container_width=True)
-        else:
-            st.info("사용량 데이터가 아직 없습니다.")
+        with st.spinner("보고서 생성 중(OpenAI)..."):
+            resp = oai().responses.create(model=OPENAI_MODEL, input=prompt)
+            report_text = resp.output_text.strip()
+
+        st.success("보고서 생성 완료")
+        st.markdown(report_text)
+
+        st.download_button(
+            "⬇️ 보고서(.md) 다운로드",
+            data=report_text.encode("utf-8"),
+            file_name=f"report_{income_pack['industry_code']}_{period_keys()[0]}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
     except Exception as e:
-        st.warning(f"usage_counters 조회 실패: {e}")
+        st.error(f"OpenAI 호출 실패: {e}")
+        st.stop()
+
 
 
 
