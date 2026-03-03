@@ -29,7 +29,7 @@ OPENAI_API_KEY = sget("OPENAI_API_KEY").strip()
 ADMIN_EMAIL = sget("ADMIN_EMAIL", "").strip().lower()
 ADMIN_BOOTSTRAP_KEY = sget("ADMIN_BOOTSTRAP_KEY", "").strip()
 
-DAILY_LIMIT = int(sget("DAILY_LIMIT", "5"))
+DAILY_LIMIT = int(sget("DAILY_LIMIT", "10"))
 MONTHLY_LIMIT = int(sget("MONTHLY_LIMIT", "100"))
 
 OPENAI_MODEL = sget("OPENAI_MODEL", "gpt-4.1-mini").strip()  # 필요시 변경
@@ -687,6 +687,7 @@ if btn:
     except Exception as e:
         st.error(f"OpenAI 호출 실패: {e}")
         st.stop()
+
 
 
 
